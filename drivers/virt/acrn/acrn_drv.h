@@ -7,13 +7,14 @@
 #include <linux/dev_printk.h>
 #include <linux/miscdevice.h>
 #include <linux/types.h>
+#include <linux/hashtable.h>
 
 #include "hypercall.h"
 
 extern struct miscdevice acrn_dev;
 
 #define ACRN_NAME_LEN		16
-#define ACRN_MEM_MAPPING_MAX	256
+#define ACRN_MEM_HASH_BITS	5
 
 #define ACRN_MEM_REGION_ADD	0
 #define ACRN_MEM_REGION_DEL	2
@@ -83,6 +84,7 @@ struct vm_memory_mapping {
 	void		*service_vm_va;
 	u64		user_vm_pa;
 	size_t		size;
+	struct hlist_node	hnode;
 };
 
 /**
@@ -150,10 +152,8 @@ extern rwlock_t acrn_vm_list_lock;
  * @flags:			Flags (ACRN_VM_FLAG_*) of the VM. This is VM
  *				flag management in HSM which is different
  *				from the &acrn_vm_creation.vm_flag.
- * @regions_mapping_lock:	Lock to protect &acrn_vm.regions_mapping and
- *				&acrn_vm.regions_mapping_count.
- * @regions_mapping:		Memory mappings of this VM.
- * @regions_mapping_count:	Number of memory mapping of this VM.
+ * @regions_mapping_lock:	Lock to protect &acrn_vm.regions_mapping
+ * @regions_mapping:		Memory mappings of this VM, put them in hashtable.
  * @ioreq_clients_lock:		Lock to protect ioreq_clients and default_client
  * @ioreq_clients:		The I/O request clients list of this VM
  * @default_client:		The default I/O request client
@@ -174,8 +174,7 @@ struct acrn_vm {
 	int				vcpu_num;
 	unsigned long			flags;
 	struct mutex			regions_mapping_lock;
-	struct vm_memory_mapping	regions_mapping[ACRN_MEM_MAPPING_MAX];
-	int				regions_mapping_count;
+	DECLARE_HASHTABLE(regions_mapping, ACRN_MEM_HASH_BITS);
 	spinlock_t			ioreq_clients_lock;
 	struct list_head		ioreq_clients;
 	struct acrn_ioreq_client	*default_client;
@@ -200,6 +199,7 @@ int acrn_mm_region_del(struct acrn_vm *vm, u64 user_gpa, u64 size);
 int acrn_vm_memseg_map(struct acrn_vm *vm, struct acrn_vm_memmap *memmap);
 int acrn_vm_memseg_unmap(struct acrn_vm *vm, struct acrn_vm_memmap *memmap);
 int acrn_vm_ram_map(struct acrn_vm *vm, struct acrn_vm_memmap *memmap);
+int acrn_vm_ram_unmap(struct acrn_vm *vm, struct acrn_vm_memmap *memmap);
 void acrn_vm_all_ram_unmap(struct acrn_vm *vm);
 
 int acrn_ioreq_init(struct acrn_vm *vm, u64 buf_vma);
