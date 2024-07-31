@@ -131,13 +131,16 @@ int acrn_vm_memseg_unmap(struct acrn_vm *vm, struct acrn_vm_memmap *memmap)
 {
 	int ret;
 
-	if (memmap->type != ACRN_MEMMAP_MMIO) {
-		dev_dbg(acrn_dev.this_device,
-			"Invalid memmap type: %u\n", memmap->type);
+	if (memmap->type == ACRN_MEMMAP_MMIO) {
+		ret = acrn_mm_region_del(vm, memmap->user_vm_pa, memmap->len);
+	} else if (memmap->type == ACRN_MEMMAP_RAM) {
+		ret = acrn_vm_ram_unmap(vm, memmap);
+	} else {
+		dev_dbg(acrn_dev.this_device, "Invalid memmap type: %u\n",
+			 memmap->type);
 		return -EINVAL;
 	}
 
-	ret = acrn_mm_region_del(vm, memmap->user_vm_pa, memmap->len);
 	if (ret < 0)
 		dev_dbg(acrn_dev.this_device,
 			"Del memory region failed, VM[%u]!\n", vm->vmid);
@@ -257,21 +260,22 @@ int acrn_vm_ram_map(struct acrn_vm *vm, struct acrn_vm_memmap *memmap)
 
 	/* Record Service VM va <-> User VM pa mapping */
 	mutex_lock(&vm->regions_mapping_lock);
-	region_mapping = &vm->regions_mapping[vm->regions_mapping_count];
-	if (vm->regions_mapping_count < ACRN_MEM_MAPPING_MAX) {
-		region_mapping->pages = pages;
-		region_mapping->npages = nr_pages;
-		region_mapping->size = memmap->len;
-		region_mapping->service_vm_va = remap_vaddr;
-		region_mapping->user_vm_pa = memmap->user_vm_pa;
-		vm->regions_mapping_count++;
-	} else {
-		dev_warn(acrn_dev.this_device,
-			"Run out of memory mapping slots!\n");
+	region_mapping = kmalloc(sizeof(*region_mapping), GFP_KERNEL);
+	if (!region_mapping) {
 		ret = -ENOMEM;
 		mutex_unlock(&vm->regions_mapping_lock);
 		goto unmap_no_count;
 	}
+
+	region_mapping->pages = pages;
+	region_mapping->npages = nr_pages;
+	region_mapping->size = memmap->len;
+	region_mapping->service_vm_va = remap_vaddr;
+	region_mapping->user_vm_pa = memmap->user_vm_pa;
+
+	hash_add(vm->regions_mapping, &region_mapping->hnode,
+		 region_mapping->user_vm_pa);
+
 	mutex_unlock(&vm->regions_mapping_lock);
 
 	/* Calculate count of vm_memory_region_op */
@@ -333,7 +337,8 @@ unset_region:
 	kfree(regions_info);
 unmap_kernel_map:
 	mutex_lock(&vm->regions_mapping_lock);
-	vm->regions_mapping_count--;
+	hash_del(&region_mapping->hnode);
+	kfree(region_mapping);
 	mutex_unlock(&vm->regions_mapping_lock);
 unmap_no_count:
 	vunmap(remap_vaddr);
@@ -346,21 +351,135 @@ free_pages:
 }
 
 /**
+ * acrn_vm_ram_unmap() - Unmap a RAM EPT for User VM.
+ * @vm:		The User VM pointer
+ * @memmap:	Info of the EPT mapping
+ *
+ * Return: 0 on success, <0 for error.
+ */
+int acrn_vm_ram_unmap(struct acrn_vm *vm, struct acrn_vm_memmap *memmap)
+{
+	struct vm_memory_region_batch *regions_info;
+	struct vm_memory_mapping *region_mapping = NULL;
+	struct vm_memory_region_op *vm_region;
+	struct page *page;
+	u64 user_vm_pa;
+	int i, order, nr_regions = 0, ret = 0;
+
+	if (!vm || !memmap)
+		return -EINVAL;
+
+	mutex_lock(&vm->regions_mapping_lock);
+	hash_for_each_possible(vm->regions_mapping, region_mapping, hnode,
+				memmap->user_vm_pa)
+		if (region_mapping->user_vm_pa == memmap->user_vm_pa)
+			break;
+
+	mutex_unlock(&vm->regions_mapping_lock);
+
+	if (!region_mapping || region_mapping->user_vm_pa != memmap->user_vm_pa) {
+		dev_err(acrn_dev.this_device,
+			 "Failed to unset ram regions, not found the user-GPA[%pK], VM[%u]!\n",
+			 (void *)memmap->user_vm_pa, vm->vmid);
+		return -EINVAL;
+	}
+
+	if (region_mapping->size != memmap->len) {
+		dev_err(acrn_dev.this_device,
+			 "Failed to unset ram regions, size %lld not equal to %ld, VM[%u]!\n",
+			 memmap->len, region_mapping->size, vm->vmid);
+		return -EINVAL;
+	}
+
+	/* Calculate count of vm_memory_region_op */
+	i = 0;
+	while (i < region_mapping->npages) {
+		page = region_mapping->pages[i];
+		VM_BUG_ON_PAGE(PageTail(page), page);
+		order = compound_order(page);
+		nr_regions++;
+		i += 1 << order;
+	}
+
+	/* Prepare the vm_memory_region_batch */
+	regions_info =
+		kzalloc(sizeof(*regions_info) + sizeof(*vm_region) * nr_regions,
+			GFP_KERNEL);
+	if (!regions_info)
+		return -ENOMEM;
+
+	/* Fill each vm_memory_region_op */
+	vm_region = (struct vm_memory_region_op *)(regions_info + 1);
+	regions_info->vmid = vm->vmid;
+	regions_info->regions_num = nr_regions;
+	regions_info->regions_gpa = virt_to_phys(vm_region);
+	user_vm_pa = memmap->user_vm_pa;
+	i = 0;
+	while (i < region_mapping->npages) {
+		u32 region_size;
+
+		page = region_mapping->pages[i];
+		VM_BUG_ON_PAGE(PageTail(page), page);
+		order = compound_order(page);
+		region_size = PAGE_SIZE << order;
+		vm_region->type = ACRN_MEM_REGION_DEL;
+		vm_region->user_vm_pa = user_vm_pa;
+		vm_region->service_vm_pa = page_to_phys(page);
+		vm_region->size = region_size;
+		vm_region->attr = 0;
+		vm_region++;
+		user_vm_pa += region_size;
+		i += 1 << order;
+	}
+
+	/* Inform the ACRN Hypervisor to unset the EPT mappings */
+	ret = hcall_set_memory_regions(virt_to_phys(regions_info));
+	if (ret < 0) {
+		dev_err(acrn_dev.this_device,
+			 "Failed to unset regions, VM[%u]!\n", vm->vmid);
+		kfree(regions_info);
+		return ret;
+	}
+
+	mutex_lock(&vm->regions_mapping_lock);
+	vunmap(region_mapping->service_vm_va);
+	for (i = 0; i < region_mapping->npages; i++)
+		unpin_user_page(region_mapping->pages[i]);
+	vfree(region_mapping->pages);
+	hash_del(&region_mapping->hnode);
+	kfree(region_mapping);
+	mutex_unlock(&vm->regions_mapping_lock);
+
+	kfree(regions_info);
+
+	dev_dbg(acrn_dev.this_device,
+		 "%s: VM[%u] service-GVA[%pK] user-GPA[%pK] size[0x%llx]\n",
+		 __func__, vm->vmid, region_mapping->service_vm_va, (void *)memmap->user_vm_pa,
+		 memmap->len);
+
+	return ret;
+}
+
+/**
  * acrn_vm_all_ram_unmap() - Destroy a RAM EPT mapping of User VM.
  * @vm:	The User VM
  */
 void acrn_vm_all_ram_unmap(struct acrn_vm *vm)
 {
 	struct vm_memory_mapping *region_mapping;
-	int i, j;
+	int i, bkt;
+	struct hlist_node *tmp;
 
 	mutex_lock(&vm->regions_mapping_lock);
-	for (i = 0; i < vm->regions_mapping_count; i++) {
-		region_mapping = &vm->regions_mapping[i];
+	hash_for_each_safe(vm->regions_mapping, bkt, tmp, region_mapping,
+			    hnode) {
 		vunmap(region_mapping->service_vm_va);
-		for (j = 0; j < region_mapping->npages; j++)
-			unpin_user_page(region_mapping->pages[j]);
+		for (i = 0; i < region_mapping->npages; i++)
+			unpin_user_page(region_mapping->pages[i]);
+
 		vfree(region_mapping->pages);
+		hash_del(&region_mapping->hnode);
+		kfree(region_mapping);
 	}
 	mutex_unlock(&vm->regions_mapping_lock);
 }
