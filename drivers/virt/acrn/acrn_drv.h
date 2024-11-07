@@ -18,6 +18,9 @@ extern struct miscdevice acrn_dev;
 #define ACRN_MEM_REGION_ADD	0
 #define ACRN_MEM_REGION_DEL	2
 
+#define ACRN_EVENT_CREATE_VM 0
+#define ACRN_EVENT_DESTROY_VM 1
+
 struct acrn_vm;
 struct acrn_ioreq_client;
 
@@ -225,5 +228,13 @@ void acrn_ioeventfd_deinit(struct acrn_vm *vm);
 int acrn_irqfd_init(struct acrn_vm *vm);
 int acrn_irqfd_config(struct acrn_vm *vm, struct acrn_irqfd *args);
 void acrn_irqfd_deinit(struct acrn_vm *vm);
+
+int acrn_vm_register_notifier(struct notifier_block *nb);
+
+int acrn_vm_unregister_notifier(struct notifier_block *nb);
+
+void *acrn_get_hva(struct acrn_vm *vm, u64 gpa);
+
+struct page *acrn_get_page(struct acrn_vm *vm, u64 gpa);
 
 #endif /* __ACRN_HSM_DRV_H */

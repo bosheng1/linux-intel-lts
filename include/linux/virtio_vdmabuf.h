@@ -29,16 +29,15 @@
 
 #include <uapi/linux/virtio_vdmabuf.h>
 #include <linux/hashtable.h>
-#include <linux/kvm_types.h>
 
 struct virtio_vdmabuf_shared_pages {
 	/* cross-VM ref addr for the buffer */
-	gpa_t ref;
+	u64 ref;
 
 	/* page array */
 	struct page **pages;
-	gpa_t **l2refs;
-	gpa_t *l3refs;
+	u64 **l2refs;
+	u64 *l3refs;
 
 	/* data offset in the first page
 	 * and data length in the last page
@@ -97,13 +96,13 @@ struct virtio_vdmabuf_info {
 	struct device *dev;
 
 	struct list_head head_vdmabuf_list;
-	struct list_head kvm_instances;
+	struct list_head vm_instances;
 
 	DECLARE_HASHTABLE(buf_list, 7);
 
 	void *priv;
 	struct mutex g_mutex;
-	struct notifier_block kvm_notifier;
+	struct notifier_block acrn_notifier;
 };
 
 /* IOCTL definitions

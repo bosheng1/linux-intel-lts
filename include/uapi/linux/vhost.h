@@ -182,5 +182,7 @@
 
 /* VHOST_VDMABUF specific defines */
 #define VHOST_VDMABUF_SET_RUNNING       _IOW(VHOST_VIRTIO, 0x90, int)
+/* VHOST_VDMABUF specific defines */
+#define VHOST_VDMABUF_SET_ID            _IOW(VHOST_VIRTIO, 0x91, int)
 
 #endif

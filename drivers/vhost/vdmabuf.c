@@ -43,8 +43,8 @@
 #include <linux/dma-buf.h>
 #include <linux/vhost.h>
 #include <linux/vfio.h>
-#include <linux/kvm_host.h>
 #include <linux/virtio_vdmabuf.h>
+#include "../virt/acrn/acrn_drv.h"
 
 #include "vhost.h"
 
@@ -56,8 +56,8 @@ enum {
 
 static struct virtio_vdmabuf_info *drv_info;
 
-struct kvm_instance {
-	struct kvm *kvm;
+struct vm_instance {
+	struct acrn_vm *acrn;
 	struct list_head link;
 };
 
@@ -70,7 +70,7 @@ struct vhost_vdmabuf {
 
 	struct list_head msg_list;
 	struct list_head list;
-	struct kvm *kvm;
+	struct acrn_vm *acrn;
 };
 
 static inline void vhost_vdmabuf_add(struct vhost_vdmabuf *new)
@@ -116,27 +116,14 @@ static inline void vhost_vdmabuf_del_all(void)
 	}
 }
 
-static void *map_gpa(struct kvm_vcpu *vcpu, gpa_t gpa)
+static void *map_gpa(struct acrn_vm *vm, u64 gpa)
 {
-	struct kvm_host_map map;
-	int ret;
-
-	ret = kvm_vcpu_map(vcpu, gpa_to_gfn(gpa), &map);
-	if (ret < 0)
-		return ERR_PTR(ret);
-	else
-		return map.hva;
+	return acrn_get_hva(vm, gpa);
 }
 
-static void unmap_hva(struct kvm_vcpu *vcpu, gpa_t hva)
+static void unmap_hva(struct acrn_vm *vm, u64 hva)
 {
-	struct page *page = virt_to_page(hva);
-	struct kvm_host_map map;
 
-	map.hva = (void *)hva;
-	map.page = page;
-
-	kvm_vcpu_unmap(vcpu, &map, true);
 }
 
 /* mapping guest's pages for the vdmabuf */
@@ -145,17 +132,17 @@ vhost_vdmabuf_map_pages(u64 vmid,
 		        struct virtio_vdmabuf_shared_pages *pages_info)
 {
 	struct vhost_vdmabuf *vdmabuf = vhost_vdmabuf_find(vmid);
-	struct kvm_vcpu *vcpu;
+	struct acrn_vm *vm;
 	void *paddr;
 	int npgs = REFS_PER_PAGE;
 	int last_nents, n_l2refs;
 	int i, j = 0, k = 0;
 
-	if (!vdmabuf || !vdmabuf->kvm || !pages_info || pages_info->pages)
+	if (!vdmabuf || !vdmabuf->acrn || !pages_info || pages_info->pages)
 		return -EINVAL;
 
-	vcpu = kvm_get_vcpu_by_id(vdmabuf->kvm, 0);
-	if (!vcpu)
+	vm = vdmabuf->acrn;
+	if (!vm)
 		return -EINVAL;
 
 	last_nents = (pages_info->nents - 1) % npgs + 1;
@@ -167,16 +154,16 @@ vhost_vdmabuf_map_pages(u64 vmid,
 	if (!pages_info->pages)
 		goto fail_page_alloc;
 
-	pages_info->l2refs = kcalloc(n_l2refs, sizeof(gpa_t *), GFP_KERNEL);
+	pages_info->l2refs = kcalloc(n_l2refs, sizeof(u64 *), GFP_KERNEL);
 	if (!pages_info->l2refs)
 		goto fail_l2refs;
 
-	pages_info->l3refs = (gpa_t *)map_gpa(vcpu, pages_info->ref);
+	pages_info->l3refs = (u64 *)map_gpa(vm, pages_info->ref);
 	if (IS_ERR(pages_info->l3refs))
 		goto fail_l3refs;
 
 	for (i = 0; i < n_l2refs; i++) {
-		pages_info->l2refs[i] = (gpa_t *)map_gpa(vcpu,
+		pages_info->l2refs[i] = (u64 *)map_gpa(vm,
 							 pages_info->l3refs[i]);
 
 		if (IS_ERR(pages_info->l2refs[i]))
@@ -187,32 +174,32 @@ vhost_vdmabuf_map_pages(u64 vmid,
 			npgs = last_nents;
 
 		for (j = 0; j < npgs; j++) {
-			paddr = map_gpa(vcpu, pages_info->l2refs[i][j]);
-			if (IS_ERR(paddr))
+			struct page *page = acrn_get_page(vm, pages_info->l2refs[i][j]);
+			if (!page)
 				goto fail_mapping_l1;
 
-			pages_info->pages[k] = virt_to_page(paddr);
+			pages_info->pages[k] = page;
 			k++;
 		}
-		unmap_hva(vcpu, pages_info->l3refs[i]);
+		unmap_hva(vm, pages_info->l3refs[i]);
 	}
 
-	unmap_hva(vcpu, pages_info->ref);
+	unmap_hva(vm, pages_info->ref);
 
 	return 0;
 
 fail_mapping_l1:
 	for (k = 0; k < j; k++)
-		unmap_hva(vcpu, pages_info->l2refs[i][k]);
+		unmap_hva(vm, pages_info->l2refs[i][k]);
 
 fail_mapping_l2:
 	for (j = 0; j < i; j++) {
 		for (k = 0; k < REFS_PER_PAGE; k++)
-			unmap_hva(vcpu, pages_info->l2refs[i][k]);
+			unmap_hva(vm, pages_info->l2refs[i][k]);
 	}
 
-	unmap_hva(vcpu, pages_info->l3refs[i]);
-	unmap_hva(vcpu, pages_info->ref);
+	unmap_hva(vm, pages_info->l3refs[i]);
+	unmap_hva(vm, pages_info->ref);
 
 fail_l3refs:
 	kfree(pages_info->l2refs);
@@ -230,27 +217,27 @@ vhost_vdmabuf_unmap_pages(u64 vmid,
 			  struct virtio_vdmabuf_shared_pages *pages_info)
 {
 	struct vhost_vdmabuf *vdmabuf = vhost_vdmabuf_find(vmid);
-	struct kvm_vcpu *vcpu;
+	struct acrn_vm *vm;
 	int last_nents = (pages_info->nents - 1) % REFS_PER_PAGE + 1;
 	int n_l2refs = (pages_info->nents / REFS_PER_PAGE) +
 		       ((last_nents > 0) ? 1 : 0) -
 		       (last_nents == REFS_PER_PAGE);
 	int i, j;
 
-	if (!vdmabuf || !vdmabuf->kvm || !pages_info || pages_info->pages)
+	if (!vdmabuf || !vdmabuf->acrn || !pages_info || pages_info->pages)
 		return -EINVAL;
 
-	vcpu = kvm_get_vcpu_by_id(vdmabuf->kvm, 0);
-	if (!vcpu)
+	vm = vdmabuf->acrn;
+	if (!vm)
 		return -EINVAL;
 
 	for (i = 0; i < n_l2refs - 1; i++) {
 		for (j = 0; j < REFS_PER_PAGE; j++)
-			unmap_hva(vcpu, pages_info->l2refs[i][j]);
+			unmap_hva(vm, pages_info->l2refs[i][j]);
 	}
 
 	for (j = 0; j < last_nents; j++)
-		unmap_hva(vcpu, pages_info->l2refs[i][j]);
+		unmap_hva(vm, pages_info->l2refs[i][j]);
 
 	kfree(pages_info->l2refs);
 	kfree(pages_info->pages);
@@ -369,7 +356,7 @@ static int vhost_vdmabuf_dmabuf_mmap(struct dma_buf *dmabuf,
 }
 
 static int vhost_vdmabuf_dmabuf_vmap(struct dma_buf *dmabuf,
-				     struct dma_buf_map *map)
+				     struct iosys_map *map)
 {
 	struct virtio_vdmabuf_buf *imp;
 	void *addr;
@@ -426,7 +413,7 @@ static int vhost_vdmabuf_exp_fd(struct virtio_vdmabuf_buf *imp, int flags)
 
 	/* multiple of PAGE_SIZE, not considering offset */
 	exp_info.size = imp->pages_info->nents * PAGE_SIZE;
-	exp_info.flags = O_CLOEXEC;
+	exp_info.flags = O_CLOEXEC | O_RDWR;
 	exp_info.priv = imp;
 
 	if (!imp->dma_buf) {
@@ -540,7 +527,7 @@ static int register_exported(struct vhost_vdmabuf *vdmabuf,
 	imp->pages_info->nents = ops[VIRTIO_VDMABUF_NUM_PAGES_SHARED];
 	imp->pages_info->first_ofst = ops[VIRTIO_VDMABUF_FIRST_PAGE_DATA_OFFSET];
 	imp->pages_info->last_len = ops[VIRTIO_VDMABUF_LAST_PAGE_DATA_LENGTH];
-	imp->pages_info->ref = *(gpa_t *)&ops[VIRTIO_VDMABUF_REF_ADDR_UPPER_32BIT];
+	imp->pages_info->ref = *(u64 *)&ops[VIRTIO_VDMABUF_REF_ADDR_UPPER_32BIT];
 	imp->vmid = vdmabuf->vmid;
 	imp->valid = true;
 
@@ -734,35 +721,35 @@ static void vhost_vdmabuf_handle_recv_kick(struct vhost_work *work)
 	send_to_recvq(vdmabuf, vq);
 }
 
-static int vhost_vdmabuf_get_kvm(struct notifier_block *nb,
+static int vhost_vdmabuf_get_acrn(struct notifier_block *nb,
 				 unsigned long event, void *data)
 {
-	struct kvm_instance *instance;
+	struct vm_instance *instance;
 	struct virtio_vdmabuf_info *drv = container_of(nb,
 						struct virtio_vdmabuf_info,
-						kvm_notifier);
+						acrn_notifier);
 
 	instance = kzalloc(sizeof(*instance), GFP_KERNEL);
-	if (instance && event == KVM_EVENT_CREATE_VM) {
+	if (instance && event == ACRN_EVENT_CREATE_VM) {
 		if (data) {
-			instance->kvm = data;
+			instance->acrn = data;
 			list_add_tail(&instance->link,
-				      &drv->kvm_instances);
+				      &drv->vm_instances);
 		}
 	}
 
 	return NOTIFY_OK;
 }
 
-static struct kvm *find_kvm_instance(u64 vmid)
+static struct acrn_vm *find_vm_instance(u64 vmid)
 {
-	struct kvm_instance *instance, *tmp;
-	struct kvm *kvm = NULL;
+	struct vm_instance *instance, *tmp;
+	struct acrn_vm *acrn = NULL;
 
-	list_for_each_entry_safe(instance, tmp, &drv_info->kvm_instances,
+	list_for_each_entry_safe(instance, tmp, &drv_info->vm_instances,
                                  link) {
-		if (instance->kvm->userspace_pid == vmid) {
-			kvm = instance->kvm;
+		if (instance->acrn->vmid == vmid) {
+			acrn = instance->acrn;
 
 			list_del(&instance->link);
 			kfree(instance);
@@ -770,7 +757,7 @@ static struct kvm *find_kvm_instance(u64 vmid)
 		}
 	}
 
-	return kvm;
+	return acrn;
 }
 
 static int vhost_vdmabuf_open(struct inode *inode, struct file *filp)
@@ -813,8 +800,8 @@ static int vhost_vdmabuf_open(struct inode *inode, struct file *filp)
 
 	INIT_LIST_HEAD(&vdmabuf->msg_list);
 	vhost_work_init(&vdmabuf->send_work, vhost_send_msg_work);
-	vdmabuf->vmid = task_pid_nr(current);
-	vdmabuf->kvm = find_kvm_instance(vdmabuf->vmid);
+	vdmabuf->vmid = 0;
+	vdmabuf->acrn = NULL;
 	vhost_vdmabuf_add(vdmabuf);
 
 	mutex_init(&vdmabuf->evq->e_readlock);
@@ -833,13 +820,7 @@ static int vhost_vdmabuf_open(struct inode *inode, struct file *filp)
 
 static void vhost_vdmabuf_flush(struct vhost_vdmabuf *vdmabuf)
 {
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(vdmabuf->vqs); i++)
-		if (vdmabuf->vqs[i].handle_kick)
-			vhost_poll_flush(&vdmabuf->vqs[i].poll);
-
-	vhost_work_flush(&vdmabuf->dev, &vdmabuf->send_work);
+	vhost_dev_flush(&vdmabuf->dev);
 }
 
 static int vhost_vdmabuf_release(struct inode *inode, struct file *filp)
@@ -890,10 +871,10 @@ static ssize_t vhost_vdmabuf_event_read(struct file *filp, char __user *buf,
 	struct vhost_vdmabuf *vdmabuf = filp->private_data;
 	int ret;
 
-	if (task_pid_nr(current) != vdmabuf->vmid) {
-		dev_err(drv_info->dev, "current process cannot read events\n");
-		return -EPERM;
-	}
+	// if (task_pid_nr(current) != vdmabuf->vmid) {
+	// 	dev_err(drv_info->dev, "current process cannot read events\n");
+	// 	return -EPERM;
+	// }
 
 	/* make sure user buffer can be written */
 	if (!access_ok(buf, sizeof(*buf))) {
@@ -1098,6 +1079,7 @@ static int vhost_core_ioctl(struct file *filp, unsigned int cmd,
 	struct vhost_vdmabuf *vdmabuf = filp->private_data;
 	void __user *argp = (void __user *)param;
 	u64 features;
+	u64 vmid;
 	int ret, start;
 
 	switch (cmd) {
@@ -1118,6 +1100,12 @@ static int vhost_core_ioctl(struct file *filp, unsigned int cmd,
                 	return vhost_vdmabuf_start(vdmabuf);
                 else
                         return vhost_vdmabuf_stop(vdmabuf);
+	case VHOST_VDMABUF_SET_ID:
+		if (copy_from_user(&vmid, argp, sizeof(start)))
+                return -EFAULT;
+		vdmabuf->vmid = vmid;
+		vdmabuf->acrn = find_vm_instance(vdmabuf->vmid);
+		return 0;
 	default:
 		mutex_lock(&vdmabuf->dev.mutex);
 		ret = vhost_dev_ioctl(&vdmabuf->dev, cmd, argp);
@@ -1347,10 +1335,10 @@ static int __init vhost_vdmabuf_init(void)
 	mutex_init(&drv_info->g_mutex);
 
 	INIT_LIST_HEAD(&drv_info->head_vdmabuf_list);
-	INIT_LIST_HEAD(&drv_info->kvm_instances);
+	INIT_LIST_HEAD(&drv_info->vm_instances);
 
-	drv_info->kvm_notifier.notifier_call = vhost_vdmabuf_get_kvm;
-	ret = kvm_vm_register_notifier(&drv_info->kvm_notifier);
+	drv_info->acrn_notifier.notifier_call = vhost_vdmabuf_get_acrn;
+	ret = acrn_vm_register_notifier(&drv_info->acrn_notifier);
 
 	return ret;
 }
@@ -1360,7 +1348,7 @@ static void __exit vhost_vdmabuf_deinit(void)
 	misc_deregister(&vhost_vdmabuf_miscdev);
 	vhost_vdmabuf_del_all();
 
-	kvm_vm_unregister_notifier(&drv_info->kvm_notifier);
+	acrn_vm_unregister_notifier(&drv_info->acrn_notifier);
 	kfree(drv_info);
 	drv_info = NULL;
 }

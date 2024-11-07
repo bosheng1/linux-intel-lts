@@ -91,7 +91,7 @@ config VHOST_CROSS_ENDIAN_LEGACY
 
 config VHOST_VDMABUF
 	bool "Vhost backend for the Vdmabuf driver"
-	depends on KVM && EVENTFD
+	depends on ACRN_GUEST && EVENTFD
 	select VHOST
 	default n
 	help

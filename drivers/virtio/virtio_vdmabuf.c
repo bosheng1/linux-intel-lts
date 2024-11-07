@@ -45,6 +45,10 @@
 #include <linux/virtio_config.h>
 #include <linux/virtio_vdmabuf.h>
 
+struct virtio_vdmabuf_config {
+        uint64_t vmid;
+}__attribute__((packed));
+
 #define VIRTIO_VDMABUF_MAX_ID INT_MAX
 #define REFS_PER_PAGE (PAGE_SIZE/sizeof(long))
 #define NEW_BUF_ID_GEN(vmid, cnt) (((vmid & 0xFFFFFFFF) << 32) | \
@@ -105,32 +109,32 @@ static int virtio_vdmabuf_share_buf(struct virtio_vdmabuf_buf *exp)
 	int n_l2refs = nents/REFS_PER_PAGE +
 		       ((nents % REFS_PER_PAGE) ? 1 : 0);
 
-	pages_info->l3refs = (gpa_t *)__get_free_page(GFP_KERNEL);
+	pages_info->l3refs = (u64 *)__get_free_page(GFP_KERNEL);
 
 	if (!pages_info->l3refs) {
 		kvfree(pages_info);
 		return -ENOMEM;
 	}
 
-	pages_info->l2refs = (gpa_t **)__get_free_pages(GFP_KERNEL,
+	pages_info->l2refs = (u64 **)__get_free_pages(GFP_KERNEL,
 					get_order(n_l2refs * PAGE_SIZE));
 
 	if (!pages_info->l2refs) {
-		free_page((gpa_t)pages_info->l3refs);
+		free_page((u64)pages_info->l3refs);
 		kvfree(pages_info);
 		return -ENOMEM;
 	}
 
 	/* Share physical address of pages */
 	for (i = 0; i < nents; i++)
-		pages_info->l2refs[i] = (gpa_t *)page_to_phys(pages[i]);
+		pages_info->l2refs[i] = (u64 *)page_to_phys(pages[i]);
 
 	for (i = 0; i < n_l2refs; i++)
 		pages_info->l3refs[i] =
 			virt_to_phys((void *)pages_info->l2refs +
 				     i * PAGE_SIZE);
 
-	pages_info->ref = (gpa_t)virt_to_phys(pages_info->l3refs);
+	pages_info->ref = (u64)virt_to_phys(pages_info->l3refs);
 
 	return 0;
 }
@@ -142,8 +146,8 @@ virtio_vdmabuf_free_buf(struct virtio_vdmabuf_shared_pages *pages_info)
 	int n_l2refs = (pages_info->nents/REFS_PER_PAGE +
 		       ((pages_info->nents % REFS_PER_PAGE) ? 1 : 0));
 
-	free_pages((gpa_t)pages_info->l2refs, get_order(n_l2refs * PAGE_SIZE));
-	free_page((gpa_t)pages_info->l3refs);
+	free_pages((u64)pages_info->l2refs, get_order(n_l2refs * PAGE_SIZE));
+	free_page((u64)pages_info->l3refs);
 
 	kvfree(pages_info);
 }
@@ -577,7 +581,7 @@ static int virtio_vdmabuf_create_dmabuf(struct virtio_vdmabuf *vdmabuf,
 
 	exp_info.ops = &virtio_vdmabuf_dmabuf_ops;
 	exp_info.size = bo_size;
-	exp_info.flags = O_CLOEXEC;
+	exp_info.flags = O_CLOEXEC | O_RDWR;
 	exp_info.priv = exp_buf;
 
 	for (i = 0; i < num_pages; i++) {
@@ -657,7 +661,7 @@ static int export_notify(struct virtio_vdmabuf_buf *exp)
 	//op[6] = pages_info->last_len;
 	op[6] = PAGE_SIZE;
 
-	memcpy(&op[7], &pages_info->ref, sizeof(gpa_t));
+	memcpy(&op[7], &pages_info->ref, sizeof(u64));
 	op[9] = exp->sz_priv;
 
 	/* driver/application specific private info */
@@ -933,6 +937,7 @@ static struct miscdevice virtio_vdmabuf_miscdev = {
 
 static int virtio_vdmabuf_probe(struct virtio_device *vdev)
 {
+	uint64_t vmid = 0;
 	vq_callback_t *cbs[] = {
 		virtio_vdmabuf_recv_cb,
 		virtio_vdmabuf_send_cb,
@@ -964,7 +969,9 @@ static int virtio_vdmabuf_probe(struct virtio_device *vdev)
 		dev_err(drv_info->dev, "Cannot find any vqs\n");
 		return ret;
 	}
-
+	virtio_cread_le(vdev, struct virtio_vdmabuf_config,
+			vmid, &vmid);
+	vdmabuf->vmid = vmid;
 	INIT_LIST_HEAD(&vdmabuf->msg_list);
 	INIT_WORK(&vdmabuf->recv_work, virtio_vdmabuf_recv_work);
 	INIT_WORK(&vdmabuf->send_work, virtio_vdmabuf_send_work);
@@ -1045,6 +1052,8 @@ static int __init virtio_vdmabuf_init(void)
 	mutex_init(&drv_info->g_mutex);
 
 	mutex_init(&vdmabuf->evq->e_readlock);
+	mutex_init(&vdmabuf->recv_lock);
+	mutex_init(&vdmabuf->send_lock);
 	spin_lock_init(&vdmabuf->evq->e_lock);
 
 	INIT_LIST_HEAD(&vdmabuf->evq->e_list);
