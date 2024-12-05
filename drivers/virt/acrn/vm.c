@@ -28,11 +28,13 @@ int acrn_vm_register_notifier(struct notifier_block *nb)
 {
        return blocking_notifier_chain_register(&acrn_vm_notifier, nb);
 }
+EXPORT_SYMBOL_GPL(acrn_vm_register_notifier);
 
 int acrn_vm_unregister_notifier(struct notifier_block *nb)
 {
        return blocking_notifier_chain_unregister(&acrn_vm_notifier, nb);
 }
+EXPORT_SYMBOL_GPL(acrn_vm_unregister_notifier);
 
 struct acrn_vm *acrn_vm_create(struct acrn_vm *vm,
 			       struct acrn_vm_creation *vm_param)

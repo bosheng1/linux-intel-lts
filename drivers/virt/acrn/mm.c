@@ -384,6 +384,7 @@ void *acrn_get_hva(struct acrn_vm *vm, u64 gpa)
 	mutex_unlock(&vm->regions_mapping_lock);
 	return hva;
 }
+EXPORT_SYMBOL_GPL(acrn_get_hva);
 
 struct page *acrn_get_page(struct acrn_vm *vm, u64 gpa)
 {
@@ -408,3 +409,4 @@ struct page *acrn_get_page(struct acrn_vm *vm, u64 gpa)
         mutex_unlock(&vm->regions_mapping_lock);
         return page_hit;
 }
+EXPORT_SYMBOL_GPL(acrn_get_page);

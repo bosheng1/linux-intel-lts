@@ -28,6 +28,7 @@
 #define _UAPI_LINUX_VIRTIO_VDMABUF_H
 
 #define MAX_SIZE_PRIV_DATA 192
+#define MAX_VM_NAME_LEN 16
 
 typedef struct {
 	__u64 id;
@@ -82,6 +83,22 @@ struct virtio_vdmabuf_alloc {
 	uint32_t size;
 	/* OUT parameters */
 	int fd;
+};
+
+#define VHOST_VDMABUF_SET_ID \
+_IOC(_IOC_NONE, 'G', 6, sizeof(struct vhost_vdmabuf_set))
+struct vhost_vdmabuf_set {
+	/* IN parameters */
+	uint64_t vmid;
+	/* IN parameters */
+	char name[MAX_VM_NAME_LEN];
+};
+
+#define VIRTIO_VDMABUF_IOCTL_ATTACH \
+_IOC(_IOC_NONE, 'G', 7, sizeof(struct virtio_vdmabuf_attach))
+struct virtio_vdmabuf_attach {
+	/* IN parameters */
+	char name[MAX_VM_NAME_LEN];
 };
 
 #endif

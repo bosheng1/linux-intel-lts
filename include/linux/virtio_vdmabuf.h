@@ -97,6 +97,7 @@ struct virtio_vdmabuf_info {
 
 	struct list_head head_vdmabuf_list;
 	struct list_head vm_instances;
+	spinlock_t vdmabuf_instances_lock;
 
 	DECLARE_HASHTABLE(buf_list, 7);
 
