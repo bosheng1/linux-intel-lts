@@ -99,6 +99,7 @@ struct virtio_vdmabuf_info {
 	struct list_head vm_instances;
 	spinlock_t vdmabuf_instances_lock;
 
+	spinlock_t buf_list_lock;
 	DECLARE_HASHTABLE(buf_list, 7);
 
 	void *priv;
@@ -217,7 +218,10 @@ static inline int
 virtio_vdmabuf_add_buf(struct virtio_vdmabuf_info *info,
                        struct virtio_vdmabuf_buf *new)
 {
+	unsigned long flags;
+	spin_lock_irqsave(&info->buf_list_lock, flags);
 	hash_add(info->buf_list, &new->node, new->buf_id.id);
+	spin_unlock_irqrestore(&info->buf_list_lock, flags);
 	return 0;
 }
 
@@ -245,27 +249,32 @@ static inline struct virtio_vdmabuf_buf
 *virtio_vdmabuf_find_buf(struct virtio_vdmabuf_info *info,
 			 virtio_vdmabuf_buf_id_t *buf_id)
 {
-	struct virtio_vdmabuf_buf *found;
+	struct virtio_vdmabuf_buf *found = NULL;
+	unsigned long flags;
+	spin_lock_irqsave(&info->buf_list_lock, flags);
 
 	hash_for_each_possible(info->buf_list, found, node, buf_id->id)
 		if (is_same_buf(found->buf_id, *buf_id))
-			return found;
+			break;
+	spin_unlock_irqrestore(&info->buf_list_lock, flags);
 
-	return NULL;
+	return found;
 }
 
 /* find buf for given fd */
 static inline struct virtio_vdmabuf_buf
 *virtio_vdmabuf_find_buf_fd(struct virtio_vdmabuf_info *info, int fd)
 {
-	struct virtio_vdmabuf_buf *found;
+	struct virtio_vdmabuf_buf *found = NULL;
 	int i;
-
+	unsigned long flags;
+	spin_lock_irqsave(&info->buf_list_lock, flags);
 	hash_for_each(info->buf_list, i, found, node)
 		if (found->fd == fd)
-			return found;
+			break;
+	spin_unlock_irqrestore(&info->buf_list_lock, flags);
 
-	return NULL;
+	return found;
 }
 
 /* delete buf from hash */
@@ -273,15 +282,20 @@ static inline int
 virtio_vdmabuf_del_buf(struct virtio_vdmabuf_info *info,
                        virtio_vdmabuf_buf_id_t *buf_id)
 {
-	struct virtio_vdmabuf_buf *found;
+	struct virtio_vdmabuf_buf *found = NULL;
+	unsigned long flags;
+	int ret = -1;
+	spin_lock_irqsave(&info->buf_list_lock, flags);
 
-	found = virtio_vdmabuf_find_buf(info, buf_id);
-	if (!found)
-		return -ENOENT;
-
-	hash_del(&found->node);
-
-	return 0;
+	hash_for_each_possible(info->buf_list, found, node, buf_id->id)
+		if (is_same_buf(found->buf_id, *buf_id))
+			break;
+	if (found) {
+		hash_del(&found->node);
+		ret = 0;
+	}
+	spin_unlock_irqrestore(&info->buf_list_lock, flags);
+	return ret;
 }
 
 #endif

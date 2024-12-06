@@ -245,8 +245,7 @@ static void virtio_vdmabuf_clear_buf(struct virtio_vdmabuf_buf *exp)
 	}
 }
 
-static int remove_buf(struct virtio_vdmabuf *vdmabuf,
-		      struct virtio_vdmabuf_buf *exp)
+static int remove_buf(struct virtio_vdmabuf_buf *exp)
 {
 	int ret;
 
@@ -453,7 +452,7 @@ static int remove_all_bufs(struct virtio_vdmabuf *vdmabuf)
 	int ret;
 
 	hash_for_each_safe(drv_info->buf_list, bkt, tmp, found, node) {
-		ret = remove_buf(vdmabuf, found);
+		ret = remove_buf(found);
 		if (ret)
 			return ret;
 	}
@@ -547,6 +546,14 @@ static void virtio_vdmabuf_release_dmabuf(struct dma_buf *dmabuf)
 
 	for (i = 0; i < exp_buf->pages_info->nents; i++)
 		put_page(exp_buf->pages_info->pages[i]);
+
+	printk("bosheng dmabuf release\n");
+	virtio_vdmabuf_del_buf(drv_info, &exp_buf->buf_id);
+	virtio_vdmabuf_free_buf(exp_buf->pages_info);
+
+	if (exp_buf->sz_priv > 0 && !exp_buf->priv)
+		kvfree(exp_buf->priv);
+	kvfree(exp_buf);
 }
 
 static const struct dma_buf_ops virtio_vdmabuf_dmabuf_ops =  {
@@ -629,9 +636,9 @@ static int virtio_vdmabuf_open(struct inode *inode, struct file *filp)
 		return -EINVAL;
 	}
 
-	ret = send_msg_to_host(VIRTIO_VDMABUF_CMD_NEED_VMID, 0);
-	if (ret < 0)
-		dev_err(drv_info->dev, "fail to receive vmid\n");
+	// ret = send_msg_to_host(VIRTIO_VDMABUF_CMD_NEED_VMID, 0);
+	// if (ret < 0)
+	// 	dev_err(drv_info->dev, "fail to receive vmid\n");
 
 	filp->private_data = drv_info->priv;
 
@@ -1048,6 +1055,7 @@ static int __init virtio_vdmabuf_init(void)
 
 	drv_info->priv = (void *)vdmabuf;
 	drv_info->dev = virtio_vdmabuf_miscdev.this_device;
+	spin_lock_init(&drv_info->buf_list_lock);
 
 	mutex_init(&drv_info->g_mutex);
 
@@ -1055,6 +1063,7 @@ static int __init virtio_vdmabuf_init(void)
 	mutex_init(&vdmabuf->recv_lock);
 	mutex_init(&vdmabuf->send_lock);
 	spin_lock_init(&vdmabuf->evq->e_lock);
+	
 
 	INIT_LIST_HEAD(&vdmabuf->evq->e_list);
 	init_waitqueue_head(&vdmabuf->evq->e_wait);
