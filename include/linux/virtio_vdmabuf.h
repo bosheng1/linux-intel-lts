@@ -47,6 +47,8 @@ struct virtio_vdmabuf_shared_pages {
 
 	/* number of shared pages */
 	int nents;
+
+	u64 offset;
 };
 
 struct virtio_vdmabuf_buf {
@@ -73,6 +75,7 @@ struct virtio_vdmabuf_buf {
 
 	struct file *filp;
 	struct hlist_node node;
+	void *data_priv;
 };
 
 struct virtio_vdmabuf_event {

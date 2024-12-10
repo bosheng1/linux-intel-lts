@@ -74,6 +74,14 @@ struct vhost_vdmabuf {
 	struct list_head link;
 	struct virtio_vdmabuf_be *virtio_dmabuf;
 	struct kref ref;
+	uint32_t size;
+	uint64_t bar_gpa;
+	uint64_t bar_hva;
+	spinlock_t alloc_lock;
+	unsigned long *alloc_bitmap;
+	// unsigned int alloc_shift;
+	struct page **pages;
+	uint32_t num_pages;
 };
 
 struct virtio_vdmabuf_be {
@@ -173,7 +181,6 @@ vhost_vdmabuf_map_pages(u64 vmid,
 {
 	struct vhost_vdmabuf *vdmabuf = vhost_vdmabuf_find(vmid);
 	struct acrn_vm *vm;
-	void *paddr;
 	int npgs = REFS_PER_PAGE;
 	int last_nents, n_l2refs;
 	int i, j = 0, k = 0;
@@ -413,6 +420,7 @@ static int vhost_vdmabuf_dmabuf_vmap(struct dma_buf *dmabuf,
                     0, PAGE_KERNEL);
 	if (IS_ERR(addr))
 		return PTR_ERR(addr);
+	iosys_map_set_vaddr(map, addr);
 
 	return 0;
 }
@@ -516,7 +524,7 @@ static int send_msg_to_guest(u64 vmid, enum virtio_vdmabuf_cmd cmd, int *op)
 		return -EINVAL;
 	}
 
-	if (cmd != VIRTIO_VDMABUF_CMD_DMABUF_REL)
+	if (cmd != VIRTIO_VDMABUF_CMD_DMABUF_REL && cmd != VIRTIO_VDMABUF_CMD_EXPORT)
 		return -EINVAL;
 
 	msg = kvcalloc(1, sizeof(struct virtio_vdmabuf_msg),
@@ -524,7 +532,7 @@ static int send_msg_to_guest(u64 vmid, enum virtio_vdmabuf_cmd cmd, int *op)
 	if (!msg)
 		return -ENOMEM;
 
-	memcpy(&msg->op[0], &op[0], 8 * sizeof(int));
+	memcpy(&msg->op[0], &op[0], 10 * sizeof(int) + op[9]);
 	msg->cmd = cmd;
 
 	list_add_tail(&msg->list, &vdmabuf->msg_list);
@@ -656,6 +664,7 @@ static int parse_msg(struct vhost_vdmabuf *vdmabuf,
 {
 	virtio_vdmabuf_buf_id_t *buf_id;
 	struct virtio_vdmabuf_msg *vmid_msg;
+	struct virtio_vdmabuf_buf *imp;
 	int ret = 0;
 
 	switch (msg->cmd) {
@@ -677,6 +686,18 @@ static int parse_msg(struct vhost_vdmabuf *vdmabuf,
 		list_add_tail(&vmid_msg->list, &vdmabuf->msg_list);
 		vhost_work_queue(&vdmabuf->dev, &vdmabuf->send_work);
 
+		break;
+	case VIRTIO_VDMABUF_CMD_DMABUF_REL:
+		buf_id = (virtio_vdmabuf_buf_id_t *)msg->op;
+		imp = virtio_vdmabuf_find_buf(drv_info, buf_id);
+		if (!imp) {
+			printk("dmabuf rel: can't find buffer\n");
+			ret = -EINVAL;
+			break;
+		}
+		ret = vhost_vdmabuf_add_event(vdmabuf, imp);
+		if (ret)
+			return ret;
 		break;
 	default:
 		ret = -EINVAL;
@@ -843,6 +864,8 @@ static int vhost_vdmabuf_open(struct inode *inode, struct file *filp)
 	}
 	mutex_init(&vdmabuf->evq->e_readlock);
 	spin_lock_init(&vdmabuf->evq->e_lock);
+	spin_lock_init(&vdmabuf->alloc_lock);
+	vdmabuf->alloc_bitmap = NULL;
 
 	/* Initialize event queue */
 	INIT_LIST_HEAD(&vdmabuf->evq->e_list);
@@ -868,13 +891,21 @@ static void vdmabuf_free(struct kref *kref)
         struct vhost_vdmabuf *vdmabuf;
         printk("vdmabuf_free\n");
         vdmabuf  = container_of(kref, typeof(*vdmabuf), ref);
-		if (vdmabuf) {
-			kfree(vdmabuf->dev.vqs);
-			kfree(vdmabuf->evq);
-			kfree(vdmabuf);
-			vdmabuf = NULL;
+		if (!vdmabuf)
+			return;
+		if (vdmabuf->pages) {
+			for (int j = 0; j < vdmabuf->num_pages; j++)
+				unpin_user_page(vdmabuf->pages[j]);
+			kfree(vdmabuf->pages);
 		}
-
+		if (vdmabuf->alloc_bitmap)
+			kfree(vdmabuf->alloc_bitmap);
+	
+		vdmabuf->num_pages = 0;
+		kfree(vdmabuf->dev.vqs);
+		kfree(vdmabuf->evq);
+		kfree(vdmabuf);
+		vdmabuf = NULL;
 }
 
 void put_vhost_vdmabuf(struct vhost_vdmabuf *vdmabuf)
@@ -900,6 +931,7 @@ static int vhost_vdmabuf_release(struct inode *inode, struct file *filp)
 		vdmabuf->evq->pending--;
 	}
 	vhost_vdmabuf_flush(vdmabuf);
+	
 	vhost_dev_cleanup(&vdmabuf->dev);
 
 	put_vhost_vdmabuf(vdmabuf);
@@ -1308,16 +1340,63 @@ static int vm_set_ioctl(struct file *filp, void *data)
 	return 0;
 }
 
+static int lmem_ioctl(struct file *filp, void *data)
+{
+	struct vhost_vdmabuf *vdmabuf = filp->private_data;
+	struct virtio_vdmabuf_lmem *lmem = data;
+	int chunks, bitmap_size;
+	int pinned;
+
+	if (!lmem || !vdmabuf)
+		return -1;
+	vdmabuf->size = lmem->size;
+	vdmabuf->bar_gpa = lmem->gpa;
+	vdmabuf->bar_hva = lmem->hva;
+	vdmabuf->num_pages = DIV_ROUND_UP(vdmabuf->size, PAGE_SIZE);
+
+	chunks =  vdmabuf->num_pages;
+	bitmap_size = BITS_TO_LONGS(chunks) * sizeof(long);
+	printk("lmem ioctl: chunks:%d\n", chunks);
+	vdmabuf->alloc_bitmap = kzalloc(bitmap_size, GFP_KERNEL);
+	if (!vdmabuf->alloc_bitmap)
+		return -ENOMEM;
+
+	vdmabuf->pages = kvzalloc(vdmabuf->num_pages * sizeof(struct page *),
+					      GFP_KERNEL);
+	if (!vdmabuf->pages) {
+		kfree(vdmabuf->alloc_bitmap);
+		return -ENOMEM;
+	}
+	
+	pinned = pin_user_pages_fast(vdmabuf->bar_hva,
+                            vdmabuf->num_pages, FOLL_WRITE | FOLL_LONGTERM,
+                             vdmabuf->pages);
+	if (pinned < 0) {
+		kfree(vdmabuf->alloc_bitmap);
+		kfree(vdmabuf->pages);
+		vdmabuf->num_pages = 0;
+		return -ENOMEM;
+	} else if (pinned != vdmabuf->num_pages) {
+		for (int j = 0; j < pinned; j++)
+			unpin_user_page(vdmabuf->pages[j]);
+		kfree(vdmabuf->alloc_bitmap);
+		kfree(vdmabuf->pages);
+		vdmabuf->num_pages = 0;
+		return -ENOMEM;
+	}
+	return 0;
+}
+
 static const struct virtio_vdmabuf_ioctl_desc vhost_vdmabuf_ioctls[] = {
 		VIRTIO_VDMABUF_IOCTL_DEF(VHOST_VDMABUF_SET_ID, vm_set_ioctl, 0),
+		VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_LOCAL_MEM, lmem_ioctl, 0),
 };
 
 static long vhost_vdmabuf_ioctl(struct file *filp, unsigned int cmd,
 				unsigned long param)
 {
-	const struct virtio_vdmabuf_ioctl_desc *ioctl;
+	const struct virtio_vdmabuf_ioctl_desc *ioctl = NULL;
 	virtio_vdmabuf_ioctl_t func;
-	unsigned int nr;
 	int ret;
 	char *kdata;
 
@@ -1327,19 +1406,16 @@ static long vhost_vdmabuf_ioctl(struct file *filp, unsigned int cmd,
 		return ret;
 	}
 
-	nr = _IOC_NR(cmd);
-
-	if (nr >= ARRAY_SIZE(vhost_vdmabuf_ioctls)) {
-		dev_err(drv_info->dev, "invalid ioctl\n");
-		return -EINVAL;
+	for(int i = 0; i < ARRAY_SIZE(vhost_vdmabuf_ioctls); i++) {
+		ioctl = &vhost_vdmabuf_ioctls[i];
+		if (ioctl->cmd == cmd) {
+			func = ioctl->func;
+			break;
+		}
 	}
 
-	ioctl = &vhost_vdmabuf_ioctls[nr];
-
-	func = ioctl->func;
-
-	if (unlikely(!func)) {
-		dev_err(drv_info->dev, "no function\n");
+	if ((!func)) {
+		dev_err(drv_info->dev, "invalid ioctl\n");
 		return -EINVAL;
 	}
 
@@ -1426,34 +1502,357 @@ static int attach_ioctl(struct file *filp, void *data)
 	return 0;
 }
 
+static struct sg_table
+*virtio_vdmabuf_map_dmabuf(struct dma_buf_attachment *attachment,
+			   enum dma_data_direction dir)
+{
+	struct virtio_vdmabuf_buf *exp_buf;
+	struct sg_table *sgt;
+	struct scatterlist *sgl;
+	int i, ret;
+
+	if (!attachment->dmabuf || !attachment->dmabuf->priv)
+		return ERR_PTR(-EINVAL);
+
+	exp_buf = attachment->dmabuf->priv;
+
+	sgt = kvzalloc(sizeof(*sgt), GFP_KERNEL);
+	if (!sgt)
+		return ERR_PTR(-ENOMEM);
+
+	ret = sg_alloc_table(sgt, exp_buf->pages_info->nents, GFP_KERNEL);
+	if (ret) {
+		kvfree(sgt);
+		return ERR_PTR(ret);
+	}
+
+	sgl = sgt->sgl;
+	for (i = 0; i < exp_buf->pages_info->nents; i++) {
+		sg_set_page(sgl, exp_buf->pages_info->pages[i], PAGE_SIZE, 0);
+		sgl = sg_next(sgl);
+	}
+
+	if (!dma_map_sg(attachment->dev, sgt->sgl, sgt->nents, dir)) {
+		sg_free_table(sgt);
+		kvfree(sgt);
+		return ERR_PTR(-EINVAL);
+	}
+
+	return sgt;
+}
+
+static int virtio_vdmabuf_mmap_dmabuf(struct dma_buf *dmabuf,
+				      struct vm_area_struct *vma)
+{
+	struct virtio_vdmabuf_buf *exp_buf;
+	u64 uaddr;
+	int i, ret;
+
+	if (!dmabuf->priv)
+		return -EINVAL;
+
+	exp_buf = dmabuf->priv;
+
+	if (!exp_buf->pages_info)
+		return -EINVAL;
+
+	vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+
+	uaddr = vma->vm_start;
+	for (i = 0; i < exp_buf->pages_info->nents; i++) {
+		ret = vm_insert_page(vma, uaddr,
+				     exp_buf->pages_info->pages[i]);
+		if (ret)
+			return ret;
+
+		uaddr += PAGE_SIZE;
+	}
+
+	return 0;
+}
+
+static void virtio_vdmabuf_unmap_dmabuf(struct dma_buf_attachment *attachment,
+				        struct sg_table *sgt,
+				        enum dma_data_direction dir)
+{
+	dma_unmap_sg(attachment->dev, sgt->sgl, sgt->nents, dir);
+
+	sg_free_table(sgt);
+	kvfree(sgt);
+}
+
+static void virtio_vdmabuf_release_dmabuf(struct dma_buf *dmabuf)
+{
+	struct virtio_vdmabuf_buf *exp_buf = dmabuf->priv;
+	struct vhost_vdmabuf *vdmabuf = exp_buf->data_priv;
+	unsigned long flags;
+
+	printk("bosheng dmabuf release\n");
+	virtio_vdmabuf_del_buf(drv_info, &exp_buf->buf_id);
+
+	spin_lock_irqsave(&vdmabuf->alloc_lock, flags);
+	bitmap_clear(vdmabuf->alloc_bitmap, exp_buf->pages_info->offset,
+                             exp_buf->pages_info->nents);
+	spin_unlock_irqrestore(&vdmabuf->alloc_lock, flags);						 
+
+	kvfree(exp_buf->pages_info);
+
+	if (exp_buf->sz_priv > 0 && !exp_buf->priv)
+		kvfree(exp_buf->priv);
+	kvfree(exp_buf);
+}
+
+static const struct dma_buf_ops virtio_vdmabuf_dmabuf_ops =  {
+	.map_dma_buf = virtio_vdmabuf_map_dmabuf,
+	.unmap_dma_buf = virtio_vdmabuf_unmap_dmabuf,
+	.release = virtio_vdmabuf_release_dmabuf,
+	.mmap = virtio_vdmabuf_mmap_dmabuf,
+};
+
+int find_avail_unused_bar_address(struct vhost_vdmabuf *vdmabuf, int num_pages)
+{
+	unsigned long flags;
+	int chunk  = -ENOMEM;
+	int ret = -ENOMEM;
+	spin_lock_irqsave(&vdmabuf->alloc_lock, flags);
+	chunk = bitmap_find_next_zero_area(vdmabuf->alloc_bitmap,
+				vdmabuf->num_pages, 0, num_pages, 0);
+	if (chunk < vdmabuf->num_pages) {
+		ret = chunk;
+		bitmap_set(vdmabuf->alloc_bitmap, chunk, num_pages);
+	}
+	spin_unlock_irqrestore(&vdmabuf->alloc_lock, flags);
+	return ret;
+}
+
+#define VIRTIO_VDMABUF_MAX_ID INT_MAX
+#define NEW_BUF_ID_GEN(vmid, cnt) (((vmid & 0xFFFFFFFF) << 32) | \
+				    ((cnt) & 0xFFFFFFFF))
+static virtio_vdmabuf_buf_id_t vhost_get_buf_id(struct vhost_vdmabuf *vdmabuf)
+{
+	virtio_vdmabuf_buf_id_t buf_id = {0, {0, 0} };
+	static int count = 0;
+
+	count = count < VIRTIO_VDMABUF_MAX_ID ? count + 1 : 0;
+	buf_id.id = NEW_BUF_ID_GEN(0UL, count);
+
+	/* random data embedded in the id for security */
+	get_random_bytes(&buf_id.rng_key[0], 8);
+
+	return buf_id;
+}
+
+static int virtio_vdmabuf_create_dmabuf(struct vhost_vdmabuf *vdmabuf,
+				        uint64_t bo_size)
+{
+	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
+	struct virtio_vdmabuf_buf *exp_buf;
+	struct dma_buf *dmabuf;
+	uint32_t num_pages = DIV_ROUND_UP(bo_size, PAGE_SIZE);
+	int i, ret;
+	int chunk;
+
+	chunk = find_avail_unused_bar_address(vdmabuf, num_pages);
+	if (chunk < 0) {
+		printk("vdmabuf: no availabe space");
+		return -ENOMEM;
+	}
+	
+	exp_buf = kvzalloc(sizeof(*exp_buf), GFP_KERNEL);
+	if (!exp_buf)
+		goto err_exp;
+
+	exp_buf->pages_info = kvzalloc(sizeof (*(exp_buf->pages_info)),
+				       GFP_KERNEL);
+	if (!exp_buf->pages_info)
+		goto err_pages_info;
+
+	exp_buf->pages_info->pages = kvzalloc(num_pages * sizeof(struct page *),
+					      GFP_KERNEL);
+	if (!exp_buf->pages_info->pages)
+		goto err_pages;
+
+	exp_info.ops = &virtio_vdmabuf_dmabuf_ops;
+	exp_info.size = bo_size;
+	exp_info.flags = O_CLOEXEC | O_RDWR;
+	exp_info.priv = exp_buf;
+
+	for(i = 0; i < num_pages; i++) {
+		exp_buf->pages_info->pages[i] = vdmabuf->pages[chunk + i];
+	}
+
+	dmabuf = dma_buf_export(&exp_info);
+	if (IS_ERR_OR_NULL(dmabuf))
+		goto err_pages;
+
+	ret = dma_buf_fd(dmabuf, 0);
+	if (ret < 0)
+		goto err_pages;
+
+	exp_buf->fd = ret;
+	exp_buf->buf_id = vhost_get_buf_id(vdmabuf);
+	exp_buf->pages_info->nents = num_pages;
+	exp_buf->pages_info->offset = chunk * PAGE_SIZE;
+	exp_buf->data_priv = vdmabuf;
+
+	virtio_vdmabuf_add_buf(drv_info, exp_buf);
+
+	return ret;
+
+err_pages:
+	kvfree(exp_buf->pages_info->pages);
+err_pages_info:
+	kvfree(exp_buf->pages_info);
+err_exp:
+	kvfree(exp_buf);
+
+	return -ENOMEM;
+}
+
+static int alloc_ioctl(struct file *filp, void *data)
+{
+	struct virtio_vdmabuf_be *virtio_dmabuf = filp->private_data;
+	struct vhost_vdmabuf *vdmabuf = virtio_dmabuf->vdmabuf;
+	struct virtio_vdmabuf_alloc *attr = data;
+	int ret;
+
+	if(!vdmabuf)
+		return -1;
+	ret = virtio_vdmabuf_create_dmabuf(vdmabuf, attr->size);
+	if (ret < 0)
+		return ret;
+
+	attr->fd = ret;
+
+	return ret;
+}
+
+static int virtio_vdmabuf_share_buf(struct virtio_vdmabuf_buf *exp)
+{
+	struct virtio_vdmabuf_shared_pages *pages_info = exp->pages_info;
+
+	pages_info->ref = pages_info->offset;
+
+	return 0;
+}
+
+static int export_notify(struct virtio_vdmabuf_buf *exp)
+{
+	struct virtio_vdmabuf_shared_pages *pages_info = exp->pages_info;
+	struct vhost_vdmabuf *vdmabuf = exp->data_priv;
+	int *op;
+	int ret;
+
+	op = kvcalloc(1, sizeof(int) * 65, GFP_KERNEL);
+	if (!op)
+		return -ENOMEM;
+
+	memcpy(op, &exp->buf_id, sizeof(exp->buf_id));
+
+	op[4] = pages_info->nents;
+	op[5] = pages_info->first_ofst;
+	//op[6] = pages_info->last_len;
+	op[6] = PAGE_SIZE;
+
+	memcpy(&op[7], &pages_info->ref, sizeof(u64));
+	op[9] = exp->sz_priv;
+
+	/* driver/application specific private info */
+	memcpy(&op[10], exp->priv, op[9]);
+
+	//ret = send_msg_to_host(VIRTIO_VDMABUF_CMD_EXPORT, op);
+	ret = send_msg_to_guest(vdmabuf->vmid, VIRTIO_VDMABUF_CMD_EXPORT, op);
+
+	kvfree(op);
+	return ret;
+}
+
+static int export_ioctl(struct file *filp, void *data)
+{
+	struct virtio_vdmabuf_be *virtio_dmabuf = filp->private_data;
+	struct vhost_vdmabuf *vdmabuf = virtio_dmabuf->vdmabuf;
+	struct virtio_vdmabuf_export *attr = data;
+	struct virtio_vdmabuf_buf *exp;
+	int ret = 0;
+
+	if(!vdmabuf)
+		return -1;
+
+	exp = virtio_vdmabuf_find_buf_fd(drv_info, attr->fd);
+	if (!exp)
+		return -EINVAL;
+
+	mutex_lock(&drv_info->g_mutex);
+
+	/* possible truncation */
+	if (attr->sz_priv > MAX_SIZE_PRIV_DATA)
+		exp->sz_priv = MAX_SIZE_PRIV_DATA;
+	else
+		exp->sz_priv = attr->sz_priv;
+
+	/* creating buffer for private data */
+	if (exp->sz_priv != 0) {
+		exp->priv = kvcalloc(1, exp->sz_priv, GFP_KERNEL);
+		if (!exp->priv)
+			return -ENOMEM;
+
+		ret = copy_from_user(exp->priv, attr->priv, exp->sz_priv);
+		if (ret) {
+			ret = -EINVAL;
+			goto fail_priv;
+		}
+	}
+
+	ret = virtio_vdmabuf_share_buf(exp);
+	if (ret < 0)
+		goto fail_priv;
+
+	ret = export_notify(exp);
+	if (ret < 0)
+		goto fail_priv;
+
+	exp->valid = 1;
+	exp->filp = filp;
+	attr->buf_id = exp->buf_id;
+
+	mutex_unlock(&drv_info->g_mutex);
+
+	return ret;
+
+fail_priv:
+	kvfree(exp->priv);
+	mutex_unlock(&drv_info->g_mutex);
+
+	return ret;
+}
+
 static const struct virtio_vdmabuf_ioctl_desc virtio_vdmabuf_be_ioctls[] = {
 	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_ATTACH, attach_ioctl, 0),
 	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_IMPORT, import_ioctl, 0),
 	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_RELEASE, release_ioctl, 0),
+	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_ALLOC_FD, alloc_ioctl, 0),
+	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_EXPORT, export_ioctl, 0),
 };
 
 static long virtio_vdmabuf_be_ioctl(struct file *filp, unsigned int cmd,
 				unsigned long param)
 {
-	const struct virtio_vdmabuf_ioctl_desc *ioctl;
+	const struct virtio_vdmabuf_ioctl_desc *ioctl = NULL;
 	virtio_vdmabuf_ioctl_t func;
 	unsigned int nr;
 	int ret;
 	char *kdata;
 
-	nr = _IOC_NR(cmd);
-
-	if (nr >= ARRAY_SIZE(virtio_vdmabuf_be_ioctls)) {
-		dev_err(drv_info->dev, "invalid ioctl\n");
-		return -EINVAL;
+	for(int i = 0; i < ARRAY_SIZE(virtio_vdmabuf_be_ioctls); i++) {
+		ioctl = &virtio_vdmabuf_be_ioctls[i];
+		if (ioctl->cmd == cmd) {
+			func = ioctl->func;
+			break;
+		}
 	}
 
-	ioctl = &virtio_vdmabuf_be_ioctls[nr];
-
-	func = ioctl->func;
-
-	if (unlikely(!func)) {
-		dev_err(drv_info->dev, "no function\n");
+	if ((!func)) {
+		dev_err(drv_info->dev, "invalid ioctl\n");
 		return -EINVAL;
 	}
 
@@ -1525,6 +1924,7 @@ static int __init vhost_vdmabuf_init(void)
 	spin_lock_init(&drv_info->vdmabuf_instances_lock);
 	INIT_LIST_HEAD(&drv_info->head_vdmabuf_list);
 	INIT_LIST_HEAD(&drv_info->vm_instances);
+	spin_lock_init(&drv_info->buf_list_lock);
 
 	drv_info->acrn_notifier.notifier_call = vhost_vdmabuf_get_acrn;
 	ret = acrn_vm_register_notifier(&drv_info->acrn_notifier);

@@ -101,4 +101,13 @@ struct virtio_vdmabuf_attach {
 	char name[MAX_VM_NAME_LEN];
 };
 
+#define VIRTIO_VDMABUF_IOCTL_LOCAL_MEM \
+_IOC(_IOC_NONE, 'G', 8, sizeof(struct virtio_vdmabuf_lmem))
+struct virtio_vdmabuf_lmem {
+	/* IN parameters */
+	uint64_t hva;
+	uint64_t gpa;
+	uint64_t size;
+};
+
 #endif
