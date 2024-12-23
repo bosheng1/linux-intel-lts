@@ -110,4 +110,11 @@ struct virtio_vdmabuf_lmem {
 	uint64_t size;
 };
 
+#define VIRTIO_VDMABUF_IOCTL_UNEXPORT \
+_IOC(_IOC_NONE, 'G', 9, sizeof(struct virtio_vdmabuf_unexport))
+struct virtio_vdmabuf_unexport {
+	/* IN parameters */
+	virtio_vdmabuf_buf_id_t buf_id;
+};
+
 #endif

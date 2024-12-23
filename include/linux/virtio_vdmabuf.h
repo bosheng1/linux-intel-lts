@@ -24,8 +24,8 @@
  *
  */
 
-#ifndef _LINUX_VIRTIO_VDMABUF_H 
-#define _LINUX_VIRTIO_VDMABUF_H 
+#ifndef _LINUX_VIRTIO_VDMABUF_H
+#define _LINUX_VIRTIO_VDMABUF_H
 
 #include <uapi/linux/virtio_vdmabuf.h>
 #include <linux/hashtable.h>
@@ -53,6 +53,7 @@ struct virtio_vdmabuf_shared_pages {
 
 struct virtio_vdmabuf_buf {
 	virtio_vdmabuf_buf_id_t buf_id;
+	struct kref ref;
 
 	struct dma_buf_attachment *attach;
 	struct dma_buf *dma_buf;
@@ -62,9 +63,11 @@ struct virtio_vdmabuf_buf {
 	int fd;
 	uint64_t size;
 
+	bool unexport;
 	/* validity of the buffer */
 	bool valid;
 
+	bool is_export;
 	/* set if the buffer is imported via import_ioctl */
 	bool imported;
 
@@ -121,13 +124,10 @@ struct virtio_vdmabuf_ioctl_desc {
 	const char *name;
 };
 
-#define VIRTIO_VDMABUF_IOCTL_DEF(ioctl, _func, _flags)	\
-	[_IOC_NR(ioctl)] = {			\
-			.cmd = ioctl,		\
-			.func = _func,		\
-			.flags = _flags,	\
-			.name = #ioctl		\
-}
+#define VIRTIO_VDMABUF_IOCTL_DEF(ioctl, _func, _flags)                       \
+	[_IOC_NR(ioctl)] = {                                                 \
+		.cmd = ioctl, .func = _func, .flags = _flags, .name = #ioctl \
+	}
 
 #define VIRTIO_VDMABUF_VMID(buf_id) ((((buf_id).id) >> 32) & 0xFFFFFFFF)
 
@@ -194,13 +194,13 @@ struct virtio_vdmabuf_msg {
 enum {
 	VDMABUF_VQ_RECV = 0,
 	VDMABUF_VQ_SEND = 1,
-	VDMABUF_VQ_MAX  = 2,
+	VDMABUF_VQ_MAX = 2,
 };
 
 enum virtio_vdmabuf_cmd {
-	VIRTIO_VDMABUF_CMD_NEED_VMID,
 	VIRTIO_VDMABUF_CMD_EXPORT = 0x10,
-	VIRTIO_VDMABUF_CMD_DMABUF_REL
+	VIRTIO_VDMABUF_CMD_DMABUF_REL,
+	VIRTIO_VDMABUF_CMD_DMABUF_UNEXPORT,
 };
 
 enum virtio_vdmabuf_ops {
@@ -217,9 +217,8 @@ enum virtio_vdmabuf_ops {
 };
 
 /* adding exported/imported vdmabuf info to hash */
-static inline int
-virtio_vdmabuf_add_buf(struct virtio_vdmabuf_info *info,
-                       struct virtio_vdmabuf_buf *new)
+static inline int virtio_vdmabuf_add_buf(struct virtio_vdmabuf_info *info,
+					 struct virtio_vdmabuf_buf *new)
 {
 	unsigned long flags;
 	spin_lock_irqsave(&info->buf_list_lock, flags);
@@ -229,9 +228,8 @@ virtio_vdmabuf_add_buf(struct virtio_vdmabuf_info *info,
 }
 
 /* comparing two vdmabuf IDs */
-static inline bool
-is_same_buf(virtio_vdmabuf_buf_id_t a,
-            virtio_vdmabuf_buf_id_t b)
+static inline bool is_same_buf(virtio_vdmabuf_buf_id_t a,
+			       virtio_vdmabuf_buf_id_t b)
 {
 	int i;
 
@@ -248,9 +246,9 @@ is_same_buf(virtio_vdmabuf_buf_id_t a,
 }
 
 /* find buf for given vdmabuf ID */
-static inline struct virtio_vdmabuf_buf
-*virtio_vdmabuf_find_buf(struct virtio_vdmabuf_info *info,
-			 virtio_vdmabuf_buf_id_t *buf_id)
+static inline struct virtio_vdmabuf_buf *
+virtio_vdmabuf_find_buf(struct virtio_vdmabuf_info *info,
+			virtio_vdmabuf_buf_id_t *buf_id)
 {
 	struct virtio_vdmabuf_buf *found = NULL;
 	unsigned long flags;
@@ -265,8 +263,8 @@ static inline struct virtio_vdmabuf_buf
 }
 
 /* find buf for given fd */
-static inline struct virtio_vdmabuf_buf
-*virtio_vdmabuf_find_buf_fd(struct virtio_vdmabuf_info *info, int fd)
+static inline struct virtio_vdmabuf_buf *
+virtio_vdmabuf_find_buf_fd(struct virtio_vdmabuf_info *info, int fd)
 {
 	struct virtio_vdmabuf_buf *found = NULL;
 	int i;
@@ -281,9 +279,8 @@ static inline struct virtio_vdmabuf_buf
 }
 
 /* delete buf from hash */
-static inline int
-virtio_vdmabuf_del_buf(struct virtio_vdmabuf_info *info,
-                       virtio_vdmabuf_buf_id_t *buf_id)
+static inline int virtio_vdmabuf_del_buf(struct virtio_vdmabuf_info *info,
+					 virtio_vdmabuf_buf_id_t *buf_id)
 {
 	struct virtio_vdmabuf_buf *found = NULL;
 	unsigned long flags;

@@ -48,7 +48,7 @@
 
 #include "vhost.h"
 
-#define REFS_PER_PAGE (PAGE_SIZE/sizeof(long))
+#define REFS_PER_PAGE (PAGE_SIZE / sizeof(long))
 
 enum {
 	VHOST_VDMABUF_FEATURES = VHOST_FEATURES,
@@ -82,6 +82,7 @@ struct vhost_vdmabuf {
 	// unsigned int alloc_shift;
 	struct page **pages;
 	uint32_t num_pages;
+	bool active;
 };
 
 struct virtio_vdmabuf_be {
@@ -109,7 +110,8 @@ static inline struct vhost_vdmabuf *vhost_vdmabuf_find(u64 vmid)
 	return found;
 }
 
-static inline struct vhost_vdmabuf *vhost_vdmabuf_bind(struct virtio_vdmabuf_be *virtio_dmabuf)
+static inline struct vhost_vdmabuf *
+vhost_vdmabuf_bind(struct virtio_vdmabuf_be *virtio_dmabuf)
 {
 	struct vhost_vdmabuf *found = NULL;
 	unsigned long flags;
@@ -117,14 +119,16 @@ static inline struct vhost_vdmabuf *vhost_vdmabuf_bind(struct virtio_vdmabuf_be 
 		return found;
 	spin_lock_irqsave(&drv_info->vdmabuf_instances_lock, flags);
 	list_for_each_entry(found, &drv_info->head_vdmabuf_list, list)
-		if (strncmp(found->name, virtio_dmabuf->name, MAX_VM_NAME_LEN) == 0 &&
-								found->virtio_dmabuf == NULL)
+		if (strncmp(found->name, virtio_dmabuf->name,
+			    MAX_VM_NAME_LEN) == 0 &&
+		    found->virtio_dmabuf == NULL) {
+			found->virtio_dmabuf = virtio_dmabuf;
+			kref_get(&found->ref);
 			break;
+		}
 	spin_unlock_irqrestore(&drv_info->vdmabuf_instances_lock, flags);
 	if (found) {
 		printk("attach success\n");
-		found->virtio_dmabuf = virtio_dmabuf;
-		kref_get(&found->ref);
 	}
 	return found;
 }
@@ -135,18 +139,14 @@ static inline bool vhost_vdmabuf_del(struct vhost_vdmabuf *vdmabuf)
 	unsigned long flags;
 	int ret = false;
 	spin_lock_irqsave(&drv_info->vdmabuf_instances_lock, flags);
-	list_for_each_entry_safe(iter, temp,
-				 &drv_info->head_vdmabuf_list,
-				 list)
+	list_for_each_entry_safe(iter, temp, &drv_info->head_vdmabuf_list, list)
 		if (iter == vdmabuf) {
+			vdmabuf->virtio_dmabuf->vdmabuf = NULL;
 			list_del(&iter->list);
 			ret = true;
 			break;
 		}
 	spin_unlock_irqrestore(&drv_info->vdmabuf_instances_lock, flags);
-	if (vdmabuf->virtio_dmabuf) {
-		vdmabuf->virtio_dmabuf->vdmabuf = NULL;
-	}
 	return ret;
 }
 
@@ -155,8 +155,7 @@ static inline void vhost_vdmabuf_del_all(void)
 	struct vhost_vdmabuf *iter, *temp;
 	unsigned long flags;
 	spin_lock_irqsave(&drv_info->vdmabuf_instances_lock, flags);
-	list_for_each_entry_safe(iter, temp,
-				 &drv_info->head_vdmabuf_list,
+	list_for_each_entry_safe(iter, temp, &drv_info->head_vdmabuf_list,
 				 list) {
 		list_del(&iter->list);
 		kfree(iter);
@@ -171,91 +170,53 @@ static void *map_gpa(struct acrn_vm *vm, u64 gpa)
 
 static void unmap_hva(struct acrn_vm *vm, u64 hva)
 {
-
 }
 
-/* mapping guest's pages for the vdmabuf */
-static int
-vhost_vdmabuf_map_pages(u64 vmid,
-		        struct virtio_vdmabuf_shared_pages *pages_info)
+static int send_msg_to_guest(u64 vmid, enum virtio_vdmabuf_cmd cmd, int *op)
 {
-	struct vhost_vdmabuf *vdmabuf = vhost_vdmabuf_find(vmid);
-	struct acrn_vm *vm;
-	int npgs = REFS_PER_PAGE;
-	int last_nents, n_l2refs;
-	int i, j = 0, k = 0;
+	struct virtio_vdmabuf_msg *msg;
+	struct vhost_vdmabuf *vdmabuf;
 
-	if (!vdmabuf || !vdmabuf->acrn || !pages_info || pages_info->pages)
+	vdmabuf = vhost_vdmabuf_find(vmid);
+	if (!vdmabuf) {
+		dev_err(drv_info->dev, "can't find vdmabuf for : vmid = %llu\n",
+			vmid);
 		return -EINVAL;
-
-	vm = vdmabuf->acrn;
-	if (!vm)
-		return -EINVAL;
-
-	last_nents = (pages_info->nents - 1) % npgs + 1;
-	n_l2refs = (pages_info->nents / npgs) + ((last_nents > 0) ? 1 : 0) -
-		   (last_nents == npgs);
-
-	pages_info->pages = kcalloc(pages_info->nents, sizeof(struct page *),
-				    GFP_KERNEL);
-	if (!pages_info->pages)
-		goto fail_page_alloc;
-
-	pages_info->l2refs = kcalloc(n_l2refs, sizeof(u64 *), GFP_KERNEL);
-	if (!pages_info->l2refs)
-		goto fail_l2refs;
-
-	pages_info->l3refs = (u64 *)map_gpa(vm, pages_info->ref);
-	if (IS_ERR(pages_info->l3refs))
-		goto fail_l3refs;
-
-	for (i = 0; i < n_l2refs; i++) {
-		pages_info->l2refs[i] = (u64 *)map_gpa(vm,
-							 pages_info->l3refs[i]);
-
-		if (IS_ERR(pages_info->l2refs[i]))
-			goto fail_mapping_l2;
-
-		/* last level-2 ref */
-		if (i == n_l2refs - 1)
-			npgs = last_nents;
-
-		for (j = 0; j < npgs; j++) {
-			struct page *page = acrn_get_page(vm, pages_info->l2refs[i][j]);
-			if (!page)
-				goto fail_mapping_l1;
-
-			pages_info->pages[k] = page;
-			k++;
-		}
-		unmap_hva(vm, pages_info->l3refs[i]);
 	}
 
-	unmap_hva(vm, pages_info->ref);
+	msg = kvcalloc(1, sizeof(struct virtio_vdmabuf_msg), GFP_KERNEL);
+	if (!msg)
+		return -ENOMEM;
+
+	memcpy(&msg->op[0], &op[0], 10 * sizeof(int) + op[9]);
+	msg->cmd = cmd;
+
+	list_add_tail(&msg->list, &vdmabuf->msg_list);
+	vhost_work_queue(&vdmabuf->dev, &vdmabuf->send_work);
 
 	return 0;
+}
 
-fail_mapping_l1:
-	for (k = 0; k < j; k++)
-		unmap_hva(vm, pages_info->l2refs[i][k]);
+static int send_release_msg(struct virtio_vdmabuf_buf *vbuf)
+{
+	struct vhost_vdmabuf *vdmabuf = vbuf->data_priv;
+	int ret = 0;
+	int *op;
+	if (!vdmabuf)
+		return -ENODEV;
+	op = kcalloc(1, sizeof(int) * 65, GFP_KERNEL);
+	if (!op)
+		return -ENOMEM;
 
-fail_mapping_l2:
-	for (j = 0; j < i; j++) {
-		for (k = 0; k < REFS_PER_PAGE; k++)
-			unmap_hva(vm, pages_info->l2refs[i][k]);
+	memcpy(op, &vbuf->buf_id, sizeof(vbuf->buf_id));
+
+	ret = send_msg_to_guest(vdmabuf->vmid, VIRTIO_VDMABUF_CMD_DMABUF_REL,
+				op);
+	if (ret < 0) {
+		dev_err(drv_info->dev, "fail to send release cmd\n");
+		return ret;
 	}
-
-	unmap_hva(vm, pages_info->l3refs[i]);
-	unmap_hva(vm, pages_info->ref);
-
-fail_l3refs:
-	kfree(pages_info->l2refs);
-
-fail_l2refs:
-	kfree(pages_info->pages);
-
-fail_page_alloc:
-	return -ENOMEM;
+	return ret;
 }
 
 /* unmapping mapped pages */
@@ -293,9 +254,133 @@ vhost_vdmabuf_unmap_pages(u64 vmid,
 	return 0;
 }
 
+static void vbuf_free(struct kref *kref)
+{
+	struct virtio_vdmabuf_buf *vbuf;
+	struct vhost_vdmabuf *vdmabuf;
+	unsigned long flags;
+	vbuf = container_of(kref, typeof(*vbuf), ref);
+	printk("bosheng dmabuf free:%p, is_export:%d\n",vbuf, vbuf->is_export);
+	vdmabuf = vbuf->data_priv;
+	virtio_vdmabuf_del_buf(drv_info, &vbuf->buf_id);
+	if (!vbuf->is_export) {
+		send_release_msg(vbuf);
+		vhost_vdmabuf_unmap_pages(vbuf->vmid, vbuf->pages_info);
+	} else {
+		spin_lock_irqsave(&vdmabuf->alloc_lock, flags);
+		bitmap_clear(vdmabuf->alloc_bitmap, vbuf->pages_info->ref,
+			     vbuf->pages_info->nents);
+		spin_unlock_irqrestore(&vdmabuf->alloc_lock, flags);
+	}
+	if (vbuf->pages_info)
+		kvfree(vbuf->pages_info);
+	if (vbuf->priv)
+		kvfree(vbuf->priv);
+	kvfree(vbuf);
+}
+
+static void get_vbuf(struct virtio_vdmabuf_buf *vbuf)
+{
+	printk("bosheng get vbuf:%p, count:%d\n",vbuf, kref_read(&vbuf->ref));
+	if (vbuf) {
+		kref_get(&vbuf->ref);
+	}
+}
+static void put_vbuf(struct virtio_vdmabuf_buf *vbuf)
+{
+	printk("bosheng put vbuf:%p, count:%d\n",vbuf, kref_read(&vbuf->ref));
+	if (vbuf) {
+		kref_put(&vbuf->ref, vbuf_free);
+	}
+}
+
+/* mapping guest's pages for the vdmabuf */
+static int
+vhost_vdmabuf_map_pages(u64 vmid,
+			struct virtio_vdmabuf_shared_pages *pages_info)
+{
+	struct vhost_vdmabuf *vdmabuf = vhost_vdmabuf_find(vmid);
+	struct acrn_vm *vm;
+	int npgs = REFS_PER_PAGE;
+	int last_nents, n_l2refs;
+	int i, j = 0, k = 0;
+
+	if (!vdmabuf || !vdmabuf->acrn || !pages_info || pages_info->pages)
+		return -EINVAL;
+
+	vm = vdmabuf->acrn;
+	if (!vm)
+		return -EINVAL;
+
+	last_nents = (pages_info->nents - 1) % npgs + 1;
+	n_l2refs = (pages_info->nents / npgs) + ((last_nents > 0) ? 1 : 0) -
+		   (last_nents == npgs);
+
+	pages_info->pages =
+		kcalloc(pages_info->nents, sizeof(struct page *), GFP_KERNEL);
+	if (!pages_info->pages)
+		goto fail_page_alloc;
+
+	pages_info->l2refs = kcalloc(n_l2refs, sizeof(u64 *), GFP_KERNEL);
+	if (!pages_info->l2refs)
+		goto fail_l2refs;
+
+	pages_info->l3refs = (u64 *)map_gpa(vm, pages_info->ref);
+	if (IS_ERR(pages_info->l3refs))
+		goto fail_l3refs;
+
+	for (i = 0; i < n_l2refs; i++) {
+		pages_info->l2refs[i] =
+			(u64 *)map_gpa(vm, pages_info->l3refs[i]);
+
+		if (IS_ERR(pages_info->l2refs[i]))
+			goto fail_mapping_l2;
+
+		/* last level-2 ref */
+		if (i == n_l2refs - 1)
+			npgs = last_nents;
+
+		for (j = 0; j < npgs; j++) {
+			struct page *page =
+				acrn_get_page(vm, pages_info->l2refs[i][j]);
+			if (!page)
+				goto fail_mapping_l1;
+
+			pages_info->pages[k] = page;
+			k++;
+		}
+		unmap_hva(vm, pages_info->l3refs[i]);
+	}
+
+	unmap_hva(vm, pages_info->ref);
+
+	return 0;
+
+fail_mapping_l1:
+	for (k = 0; k < j; k++)
+		unmap_hva(vm, pages_info->l2refs[i][k]);
+
+fail_mapping_l2:
+	for (j = 0; j < i; j++) {
+		for (k = 0; k < REFS_PER_PAGE; k++)
+			unmap_hva(vm, pages_info->l2refs[i][k]);
+	}
+
+	unmap_hva(vm, pages_info->l3refs[i]);
+	unmap_hva(vm, pages_info->ref);
+
+fail_l3refs:
+	kfree(pages_info->l2refs);
+
+fail_l2refs:
+	kfree(pages_info->pages);
+
+fail_page_alloc:
+	return -ENOMEM;
+}
+
 /* create sg_table with given pages and other parameters */
-static struct sg_table *new_sgt(struct page **pgs,
-				int first_ofst, int last_len,
+static struct sg_table *new_sgt(struct page **pgs, int first_ofst, int last_len,
 				int nents)
 {
 	struct sg_table *sgt;
@@ -313,9 +398,9 @@ static struct sg_table *new_sgt(struct page **pgs,
 	}
 
 	sgl = sgt->sgl;
-	sg_set_page(sgl, pgs[0], PAGE_SIZE-first_ofst, first_ofst);
+	sg_set_page(sgl, pgs[0], PAGE_SIZE - first_ofst, first_ofst);
 
-	for (i = 1; i < nents-1; i++) {
+	for (i = 1; i < nents - 1; i++) {
 		sgl = sg_next(sgl);
 		sg_set_page(sgl, pgs[i], PAGE_SIZE, 0);
 	}
@@ -329,9 +414,9 @@ static struct sg_table *new_sgt(struct page **pgs,
 	return sgt;
 }
 
-static struct sg_table
-*vhost_vdmabuf_dmabuf_map(struct dma_buf_attachment *attachment,
-			  enum dma_data_direction dir)
+static struct sg_table *
+vhost_vdmabuf_dmabuf_map(struct dma_buf_attachment *attachment,
+			 enum dma_data_direction dir)
 {
 	struct virtio_vdmabuf_buf *imp;
 
@@ -351,8 +436,7 @@ static struct sg_table
 			return NULL;
 	}
 
-	if (!dma_map_sg(attachment->dev, imp->sgt->sgl,
-			imp->sgt->nents, dir)) {
+	if (!dma_map_sg(attachment->dev, imp->sgt->sgl, imp->sgt->nents, dir)) {
 		sg_free_table(imp->sgt);
 		kfree(imp->sgt);
 		return NULL;
@@ -361,10 +445,9 @@ static struct sg_table
 	return imp->sgt;
 }
 
-static void
-vhost_vdmabuf_dmabuf_unmap(struct dma_buf_attachment *attachment,
-	   	           struct sg_table *sg,
-			   enum dma_data_direction dir)
+static void vhost_vdmabuf_dmabuf_unmap(struct dma_buf_attachment *attachment,
+				       struct sg_table *sg,
+				       enum dma_data_direction dir)
 {
 	dma_unmap_sg(attachment->dev, sg->sgl, sg->nents, dir);
 
@@ -391,8 +474,7 @@ static int vhost_vdmabuf_dmabuf_mmap(struct dma_buf *dmabuf,
 
 	uaddr = vma->vm_start;
 	for (i = 0; i < imp->pages_info->nents; i++) {
-		err = vm_insert_page(vma, uaddr,
-				     imp->pages_info->pages[i]);
+		err = vm_insert_page(vma, uaddr, imp->pages_info->pages[i]);
 		if (err)
 			return err;
 
@@ -416,8 +498,8 @@ static int vhost_vdmabuf_dmabuf_vmap(struct dma_buf *dmabuf,
 	if (!imp->pages_info)
 		return -EINVAL;
 
-	addr = vmap(imp->pages_info->pages, imp->pages_info->nents,
-                    0, PAGE_KERNEL);
+	addr = vmap(imp->pages_info->pages, imp->pages_info->nents, 0,
+		    PAGE_KERNEL);
 	if (IS_ERR(addr))
 		return PTR_ERR(addr);
 	iosys_map_set_vaddr(map, addr);
@@ -436,12 +518,9 @@ static void vhost_vdmabuf_dmabuf_release(struct dma_buf *dma_buf)
 	imp->dma_buf = NULL;
 	imp->valid = false;
 
-	vhost_vdmabuf_unmap_pages(imp->vmid, imp->pages_info);
-	virtio_vdmabuf_del_buf(drv_info, &imp->buf_id);
+	imp->imported = false;
 
-	kfree(imp->priv);
-	kfree(imp->pages_info);
-	kfree(imp);
+	put_vbuf(imp);
 }
 
 static const struct dma_buf_ops vhost_vdmabuf_dmabuf_ops = {
@@ -512,59 +591,30 @@ static int vhost_vdmabuf_add_event(struct vhost_vdmabuf *vdmabuf,
 	return 0;
 }
 
-static int send_msg_to_guest(u64 vmid, enum virtio_vdmabuf_cmd cmd, int *op)
-{
-	struct virtio_vdmabuf_msg *msg;
-	struct vhost_vdmabuf *vdmabuf;
-
-	vdmabuf = vhost_vdmabuf_find(vmid);
-	if (!vdmabuf) {
-		dev_err(drv_info->dev,
-			"can't find vdmabuf for : vmid = %llu\n", vmid);
-		return -EINVAL;
-	}
-
-	if (cmd != VIRTIO_VDMABUF_CMD_DMABUF_REL && cmd != VIRTIO_VDMABUF_CMD_EXPORT)
-		return -EINVAL;
-
-	msg = kvcalloc(1, sizeof(struct virtio_vdmabuf_msg),
-		       GFP_KERNEL);
-	if (!msg)
-		return -ENOMEM;
-
-	memcpy(&msg->op[0], &op[0], 10 * sizeof(int) + op[9]);
-	msg->cmd = cmd;
-
-	list_add_tail(&msg->list, &vdmabuf->msg_list);
-	vhost_work_queue(&vdmabuf->dev, &vdmabuf->send_work);
-
-	return 0;
-}
-
 static int register_exported(struct vhost_vdmabuf *vdmabuf,
 			     virtio_vdmabuf_buf_id_t *buf_id, int *ops)
 {
 	struct virtio_vdmabuf_buf *imp;
 	int ret;
 
-	imp = kcalloc(1, sizeof(*imp), GFP_KERNEL);
+	imp = kvzalloc(sizeof(*imp), GFP_KERNEL);
 	if (!imp)
 		return -ENOMEM;
-
-	imp->pages_info = kcalloc(1, sizeof(struct virtio_vdmabuf_shared_pages),
-				  GFP_KERNEL);
+	kref_init(&imp->ref);
+	imp->pages_info = kvzalloc(sizeof(struct virtio_vdmabuf_shared_pages),
+				   GFP_KERNEL);
 	if (!imp->pages_info) {
-		kfree(imp);
+		kvfree(imp);
 		return -ENOMEM;
 	}
 
 	imp->sz_priv = ops[VIRTIO_VDMABUF_PRIVATE_DATA_SIZE];
 	if (imp->sz_priv) {
-		imp->priv = kcalloc(1, ops[VIRTIO_VDMABUF_PRIVATE_DATA_SIZE],
-				    GFP_KERNEL);
+		imp->priv = kvzalloc(ops[VIRTIO_VDMABUF_PRIVATE_DATA_SIZE],
+				     GFP_KERNEL);
 		if (!imp->priv) {
-			kfree(imp->pages_info);
-			kfree(imp);
+			kvfree(imp->pages_info);
+			kvfree(imp);
 			return -ENOMEM;
 		}
 	}
@@ -572,11 +622,15 @@ static int register_exported(struct vhost_vdmabuf *vdmabuf,
 	memcpy(&imp->buf_id, buf_id, sizeof(*buf_id));
 
 	imp->pages_info->nents = ops[VIRTIO_VDMABUF_NUM_PAGES_SHARED];
-	imp->pages_info->first_ofst = ops[VIRTIO_VDMABUF_FIRST_PAGE_DATA_OFFSET];
+	imp->pages_info->first_ofst =
+		ops[VIRTIO_VDMABUF_FIRST_PAGE_DATA_OFFSET];
 	imp->pages_info->last_len = ops[VIRTIO_VDMABUF_LAST_PAGE_DATA_LENGTH];
-	imp->pages_info->ref = *(u64 *)&ops[VIRTIO_VDMABUF_REF_ADDR_UPPER_32BIT];
+	imp->pages_info->ref =
+		*(u64 *)&ops[VIRTIO_VDMABUF_REF_ADDR_UPPER_32BIT];
 	imp->vmid = vdmabuf->vmid;
 	imp->valid = true;
+	imp->is_export = false;
+	imp->data_priv = vdmabuf;
 
 	virtio_vdmabuf_add_buf(drv_info, imp);
 
@@ -611,8 +665,8 @@ static void send_to_recvq(struct vhost_vdmabuf *vdmabuf,
 		if (list_empty(&vdmabuf->msg_list))
 			break;
 
-		head = vhost_get_vq_desc(vq, vq->iov, ARRAY_SIZE(vq->iov),
-					 &out, &in, NULL, NULL);
+		head = vhost_get_vq_desc(vq, vq->iov, ARRAY_SIZE(vq->iov), &out,
+					 &in, NULL, NULL);
 
 		if (head < 0 || head == vq->num)
 			break;
@@ -630,8 +684,7 @@ static void send_to_recvq(struct vhost_vdmabuf *vdmabuf,
 		ret = __copy_to_user(vq->iov[out].iov_base, msg,
 				     sizeof(struct virtio_vdmabuf_msg));
 		if (ret) {
-			dev_err(drv_info->dev,
-				"fail to copy tx msg\n");
+			dev_err(drv_info->dev, "fail to copy tx msg\n");
 			break;
 		}
 
@@ -650,9 +703,8 @@ out:
 
 static void vhost_send_msg_work(struct vhost_work *work)
 {
-	struct vhost_vdmabuf *vdmabuf = container_of(work,
-					             struct vhost_vdmabuf,
-					             send_work);
+	struct vhost_vdmabuf *vdmabuf =
+		container_of(work, struct vhost_vdmabuf, send_work);
 	struct vhost_virtqueue *vq = &vdmabuf->vqs[VDMABUF_VQ_RECV];
 
 	send_to_recvq(vdmabuf, vq);
@@ -667,24 +719,11 @@ static int parse_msg(struct vhost_vdmabuf *vdmabuf,
 	struct virtio_vdmabuf_buf *imp;
 	int ret = 0;
 
+	printk("vdmabuf: parse msg cmd:%d\n", msg->cmd);
 	switch (msg->cmd) {
 	case VIRTIO_VDMABUF_CMD_EXPORT:
 		buf_id = (virtio_vdmabuf_buf_id_t *)msg->op;
 		ret = register_exported(vdmabuf, buf_id, msg->op);
-
-		break;
-	case VIRTIO_VDMABUF_CMD_NEED_VMID:
-		vmid_msg = kvcalloc(1, sizeof(struct virtio_vdmabuf_msg),
-				    GFP_KERNEL);
-		if (!vmid_msg) {
-			ret = -ENOMEM;
-			break;
-		}
-
-		vmid_msg->cmd = msg->cmd;
-		vmid_msg->op[0] = vdmabuf->vmid;
-		list_add_tail(&vmid_msg->list, &vdmabuf->msg_list);
-		vhost_work_queue(&vdmabuf->dev, &vdmabuf->send_work);
 
 		break;
 	case VIRTIO_VDMABUF_CMD_DMABUF_REL:
@@ -692,12 +731,25 @@ static int parse_msg(struct vhost_vdmabuf *vdmabuf,
 		imp = virtio_vdmabuf_find_buf(drv_info, buf_id);
 		if (!imp) {
 			printk("dmabuf rel: can't find buffer\n");
-			ret = -EINVAL;
-			break;
+			//ret = -EINVAL;
+		} else {
+			virtio_vdmabuf_del_buf(drv_info, &imp->buf_id);
+			put_vbuf(imp);
 		}
-		ret = vhost_vdmabuf_add_event(vdmabuf, imp);
-		if (ret)
-			return ret;
+		// ret = vhost_vdmabuf_add_event(vdmabuf, imp);
+		// if (ret)
+		// 	return ret;
+		break;
+	case VIRTIO_VDMABUF_CMD_DMABUF_UNEXPORT:
+		buf_id = (virtio_vdmabuf_buf_id_t *)msg->op;
+		imp = virtio_vdmabuf_find_buf(drv_info, buf_id);
+		if (imp) {
+			virtio_vdmabuf_del_buf(drv_info, &imp->buf_id);
+			imp->unexport = true;
+			put_vbuf(imp);
+		} else {
+			printk("dmabuf rel: can't find buffer\n");
+		}
 		break;
 	default:
 		ret = -EINVAL;
@@ -709,12 +761,10 @@ static int parse_msg(struct vhost_vdmabuf *vdmabuf,
 
 static void vhost_vdmabuf_handle_send_kick(struct vhost_work *work)
 {
-	struct vhost_virtqueue *vq = container_of(work,
-						  struct vhost_virtqueue,
-						  poll.work);
-	struct vhost_vdmabuf *vdmabuf = container_of(vq->dev,
-					      	     struct vhost_vdmabuf,
-					      	     dev);
+	struct vhost_virtqueue *vq =
+		container_of(work, struct vhost_virtqueue, poll.work);
+	struct vhost_vdmabuf *vdmabuf =
+		container_of(vq->dev, struct vhost_vdmabuf, dev);
 	struct virtio_vdmabuf_msg msg;
 	int head, in, out, in_size;
 	bool added = false;
@@ -729,8 +779,8 @@ static void vhost_vdmabuf_handle_send_kick(struct vhost_work *work)
 
 	/* Make sure we will process all pending requests */
 	for (;;) {
-		head = vhost_get_vq_desc(vq, vq->iov, ARRAY_SIZE(vq->iov),
-					 &out, &in, NULL, NULL);
+		head = vhost_get_vq_desc(vq, vq->iov, ARRAY_SIZE(vq->iov), &out,
+					 &in, NULL, NULL);
 
 		if (head < 0 || head == vq->num)
 			break;
@@ -749,11 +799,8 @@ static void vhost_vdmabuf_handle_send_kick(struct vhost_work *work)
 
 		ret = parse_msg(vdmabuf, &msg);
 		if (ret) {
-			dev_err(drv_info->dev,
-				"msg parse error: %d",
-				ret);
-			dev_err(drv_info->dev,
-				" cmd: %d\n", msg.cmd);
+			dev_err(drv_info->dev, "msg parse error: %d", ret);
+			dev_err(drv_info->dev, " cmd: %d\n", msg.cmd);
 
 			break;
 		}
@@ -771,30 +818,26 @@ out:
 
 static void vhost_vdmabuf_handle_recv_kick(struct vhost_work *work)
 {
-	struct vhost_virtqueue *vq = container_of(work,
-						  struct vhost_virtqueue,
-						  poll.work);
-	struct vhost_vdmabuf *vdmabuf = container_of(vq->dev,
-					      	     struct vhost_vdmabuf,
-					      	     dev);
+	struct vhost_virtqueue *vq =
+		container_of(work, struct vhost_virtqueue, poll.work);
+	struct vhost_vdmabuf *vdmabuf =
+		container_of(vq->dev, struct vhost_vdmabuf, dev);
 
 	send_to_recvq(vdmabuf, vq);
 }
 
 static int vhost_vdmabuf_get_acrn(struct notifier_block *nb,
-				 unsigned long event, void *data)
+				  unsigned long event, void *data)
 {
 	struct vm_instance *instance;
-	struct virtio_vdmabuf_info *drv = container_of(nb,
-						struct virtio_vdmabuf_info,
-						acrn_notifier);
+	struct virtio_vdmabuf_info *drv =
+		container_of(nb, struct virtio_vdmabuf_info, acrn_notifier);
 
 	instance = kzalloc(sizeof(*instance), GFP_KERNEL);
 	if (instance && event == ACRN_EVENT_CREATE_VM) {
 		if (data) {
 			instance->acrn = data;
-			list_add_tail(&instance->link,
-				      &drv->vm_instances);
+			list_add_tail(&instance->link, &drv->vm_instances);
 		}
 	}
 
@@ -806,8 +849,7 @@ static struct acrn_vm *find_vm_instance(u64 vmid)
 	struct vm_instance *instance, *tmp;
 	struct acrn_vm *acrn = NULL;
 
-	list_for_each_entry_safe(instance, tmp, &drv_info->vm_instances,
-                                 link) {
+	list_for_each_entry_safe(instance, tmp, &drv_info->vm_instances, link) {
 		if (instance->acrn->vmid == vmid) {
 			acrn = instance->acrn;
 
@@ -831,13 +873,11 @@ static int vhost_vdmabuf_open(struct inode *inode, struct file *filp)
 		return -EINVAL;
 	}
 
-	vdmabuf = kzalloc(sizeof(*vdmabuf), GFP_KERNEL |
-			   __GFP_RETRY_MAYFAIL);
+	vdmabuf = kzalloc(sizeof(*vdmabuf), GFP_KERNEL | __GFP_RETRY_MAYFAIL);
 	if (!vdmabuf)
 		return -ENOMEM;
 
-	vqs = kmalloc_array(ARRAY_SIZE(vdmabuf->vqs), sizeof(*vqs),
-			    GFP_KERNEL);
+	vqs = kmalloc_array(ARRAY_SIZE(vdmabuf->vqs), sizeof(*vqs), GFP_KERNEL);
 	if (!vqs) {
 		kfree(vdmabuf);
 		return -ENOMEM;
@@ -845,11 +885,13 @@ static int vhost_vdmabuf_open(struct inode *inode, struct file *filp)
 
 	vqs[VDMABUF_VQ_SEND] = &vdmabuf->vqs[VDMABUF_VQ_SEND];
 	vqs[VDMABUF_VQ_RECV] = &vdmabuf->vqs[VDMABUF_VQ_RECV];
-	vdmabuf->vqs[VDMABUF_VQ_SEND].handle_kick = vhost_vdmabuf_handle_send_kick;
-	vdmabuf->vqs[VDMABUF_VQ_RECV].handle_kick = vhost_vdmabuf_handle_recv_kick;
+	vdmabuf->vqs[VDMABUF_VQ_SEND].handle_kick =
+		vhost_vdmabuf_handle_send_kick;
+	vdmabuf->vqs[VDMABUF_VQ_RECV].handle_kick =
+		vhost_vdmabuf_handle_recv_kick;
 
-	vhost_dev_init(&vdmabuf->dev, vqs, ARRAY_SIZE(vdmabuf->vqs),
-		       UIO_MAXIOV, 0, 0, true, NULL);
+	vhost_dev_init(&vdmabuf->dev, vqs, ARRAY_SIZE(vdmabuf->vqs), UIO_MAXIOV,
+		       0, 0, true, NULL);
 
 	INIT_LIST_HEAD(&vdmabuf->msg_list);
 	kref_init(&vdmabuf->ref);
@@ -873,7 +915,7 @@ static int vhost_vdmabuf_open(struct inode *inode, struct file *filp)
 
 	/* resetting number of pending events */
 	vdmabuf->evq->pending = 0;
-
+	vdmabuf->active = true;
 	vhost_vdmabuf_add(vdmabuf);
 
 	filp->private_data = vdmabuf;
@@ -888,31 +930,31 @@ static void vhost_vdmabuf_flush(struct vhost_vdmabuf *vdmabuf)
 
 static void vdmabuf_free(struct kref *kref)
 {
-        struct vhost_vdmabuf *vdmabuf;
-        printk("vdmabuf_free\n");
-        vdmabuf  = container_of(kref, typeof(*vdmabuf), ref);
-		if (!vdmabuf)
-			return;
-		if (vdmabuf->pages) {
-			for (int j = 0; j < vdmabuf->num_pages; j++)
-				unpin_user_page(vdmabuf->pages[j]);
-			kfree(vdmabuf->pages);
-		}
-		if (vdmabuf->alloc_bitmap)
-			kfree(vdmabuf->alloc_bitmap);
-	
-		vdmabuf->num_pages = 0;
-		kfree(vdmabuf->dev.vqs);
-		kfree(vdmabuf->evq);
-		kfree(vdmabuf);
-		vdmabuf = NULL;
+	struct vhost_vdmabuf *vdmabuf;
+	printk("vdmabuf_free\n");
+	vdmabuf = container_of(kref, typeof(*vdmabuf), ref);
+	if (!vdmabuf)
+		return;
+	if (vdmabuf->pages && vdmabuf->num_pages) {
+		for (int j = 0; j < vdmabuf->num_pages; j++)
+			unpin_user_page(vdmabuf->pages[j]);
+		kfree(vdmabuf->pages);
+	}
+	if (vdmabuf->alloc_bitmap && vdmabuf->num_pages)
+		kfree(vdmabuf->alloc_bitmap);
+
+	vdmabuf->num_pages = 0;
+	kfree(vdmabuf->dev.vqs);
+	kfree(vdmabuf->evq);
+	kfree(vdmabuf);
+	vdmabuf = NULL;
 }
 
 void put_vhost_vdmabuf(struct vhost_vdmabuf *vdmabuf)
 {
-        if (vdmabuf) {
-                kref_put(&vdmabuf->ref, vdmabuf_free);
-        }
+	if (vdmabuf) {
+		kref_put(&vdmabuf->ref, vdmabuf_free);
+	}
 }
 
 static int vhost_vdmabuf_release(struct inode *inode, struct file *filp)
@@ -920,30 +962,32 @@ static int vhost_vdmabuf_release(struct inode *inode, struct file *filp)
 	struct vhost_vdmabuf *vdmabuf = filp->private_data;
 	struct virtio_vdmabuf_event *e, *et;
 
+	vdmabuf->active = false;
 	if (!vhost_vdmabuf_del(vdmabuf))
 		return -EINVAL;
 
-	mutex_lock(&drv_info->g_mutex);
-	list_for_each_entry_safe(e, et, &vdmabuf->evq->e_list,
-				 link) {
+	// mutex_lock(&drv_info->g_mutex);
+	spin_lock_irq(&vdmabuf->evq->e_lock);
+	list_for_each_entry_safe(e, et, &vdmabuf->evq->e_list, link) {
 		list_del(&e->link);
 		kfree(e);
 		vdmabuf->evq->pending--;
 	}
+	spin_unlock_irq(&vdmabuf->evq->e_lock);
 	vhost_vdmabuf_flush(vdmabuf);
-	
+
 	vhost_dev_cleanup(&vdmabuf->dev);
 
 	put_vhost_vdmabuf(vdmabuf);
 
 	filp->private_data = NULL;
-	mutex_unlock(&drv_info->g_mutex);
+	// mutex_unlock(&drv_info->g_mutex);
 
 	return 0;
 }
 
 static unsigned int virtio_vdmabuf_be_event_poll(struct file *filp,
-				    	     struct poll_table_struct *wait)
+						 struct poll_table_struct *wait)
 {
 	struct virtio_vdmabuf_be *virtio_dmabuf = filp->private_data;
 	struct vhost_vdmabuf *vdmabuf = virtio_dmabuf->vdmabuf;
@@ -960,7 +1004,7 @@ static unsigned int virtio_vdmabuf_be_event_poll(struct file *filp,
 }
 
 static ssize_t virtio_vdmabuf_be_event_read(struct file *filp, char __user *buf,
-			       		size_t cnt, loff_t *ofst)
+					    size_t cnt, loff_t *ofst)
 {
 	struct virtio_vdmabuf_be *virtio_dmabuf = filp->private_data;
 	struct vhost_vdmabuf *vdmabuf = virtio_dmabuf->vdmabuf;
@@ -1003,18 +1047,19 @@ static ssize_t virtio_vdmabuf_be_event_read(struct file *filp, char __user *buf,
 			}
 
 			mutex_unlock(&vdmabuf->evq->e_readlock);
-			ret = wait_event_interruptible(vdmabuf->evq->e_wait,
-					!list_empty(&vdmabuf->evq->e_list));
+			ret = wait_event_interruptible(
+				vdmabuf->evq->e_wait,
+				!list_empty(&vdmabuf->evq->e_list));
 
 			if (ret == 0)
 				ret = mutex_lock_interruptible(
-						&vdmabuf->evq->e_readlock);
+					&vdmabuf->evq->e_readlock);
 
 			if (ret)
 				return ret;
 		} else {
-			unsigned int len = (sizeof(e->e_data.hdr) +
-					    e->e_data.hdr.size);
+			unsigned int len =
+				(sizeof(e->e_data.hdr) + e->e_data.hdr.size);
 
 			if (len > cnt - ret) {
 put_back_event:
@@ -1036,8 +1081,7 @@ put_back_event:
 
 			if (copy_to_user(buf + ret, e->e_data.data,
 					 e->e_data.hdr.size)) {
-
-				struct virtio_vdmabuf_e_hdr dummy_hdr = {0};
+				struct virtio_vdmabuf_e_hdr dummy_hdr = { 0 };
 
 				ret -= sizeof(e->e_data.hdr);
 
@@ -1045,7 +1089,7 @@ put_back_event:
 				if (copy_to_user(buf + ret, &dummy_hdr,
 						 sizeof(dummy_hdr)))
 					dev_err(drv_info->dev,
-					   "fail to nullify invalid hdr\n");
+						"fail to nullify invalid hdr\n");
 
 				ret = -EFAULT;
 
@@ -1068,14 +1112,14 @@ put_back_event:
 
 static int vhost_vdmabuf_start(struct vhost_vdmabuf *vdmabuf)
 {
-        struct vhost_virtqueue *vq;
-        int i, ret;
+	struct vhost_virtqueue *vq;
+	int i, ret;
 
 	mutex_lock(&vdmabuf->dev.mutex);
 
-        ret = vhost_dev_check_owner(&vdmabuf->dev);
-        if (ret)
-                goto err;
+	ret = vhost_dev_check_owner(&vdmabuf->dev);
+	if (ret)
+		goto err;
 
 	for (i = 0; i < ARRAY_SIZE(vdmabuf->vqs); i++) {
 		vq = &vdmabuf->vqs[i];
@@ -1098,11 +1142,11 @@ static int vhost_vdmabuf_start(struct vhost_vdmabuf *vdmabuf)
 	}
 
 	mutex_unlock(&vdmabuf->dev.mutex);
-        return 0;
+	return 0;
 
 err_vq:
-        vhost_vq_set_backend(vq, NULL);
-        mutex_unlock(&vq->mutex);
+	vhost_vq_set_backend(vq, NULL);
+	mutex_unlock(&vq->mutex);
 
 	for (i = 0; i < ARRAY_SIZE(vdmabuf->vqs); i++) {
 		vq = &vdmabuf->vqs[i];
@@ -1114,19 +1158,19 @@ err_vq:
 
 err:
 	mutex_unlock(&vdmabuf->dev.mutex);
-        return ret;
+	return ret;
 }
 
 static int vhost_vdmabuf_stop(struct vhost_vdmabuf *vdmabuf)
 {
-        struct vhost_virtqueue *vq;
-        int i, ret;
+	struct vhost_virtqueue *vq;
+	int i, ret;
 
 	mutex_lock(&vdmabuf->dev.mutex);
 
-        ret = vhost_dev_check_owner(&vdmabuf->dev);
-        if (ret)
-                goto err;
+	ret = vhost_dev_check_owner(&vdmabuf->dev);
+	if (ret)
+		goto err;
 
 	for (i = 0; i < ARRAY_SIZE(vdmabuf->vqs); i++) {
 		vq = &vdmabuf->vqs[i];
@@ -1138,7 +1182,7 @@ static int vhost_vdmabuf_stop(struct vhost_vdmabuf *vdmabuf)
 
 err:
 	mutex_unlock(&vdmabuf->dev.mutex);
-        return ret;
+	return ret;
 }
 
 static int vhost_vdmabuf_set_features(struct vhost_vdmabuf *vdmabuf,
@@ -1189,12 +1233,12 @@ static int vhost_core_ioctl(struct file *filp, unsigned int cmd,
 		return vhost_vdmabuf_set_features(vdmabuf, features);
 	case VHOST_VDMABUF_SET_RUNNING:
 		if (copy_from_user(&start, argp, sizeof(start)))
-                        return -EFAULT;
+			return -EFAULT;
 
 		if (start)
-                	return vhost_vdmabuf_start(vdmabuf);
-                else
-                        return vhost_vdmabuf_stop(vdmabuf);
+			return vhost_vdmabuf_start(vdmabuf);
+		else
+			return vhost_vdmabuf_stop(vdmabuf);
 	default:
 		mutex_lock(&vdmabuf->dev.mutex);
 		ret = vhost_dev_ioctl(&vdmabuf->dev, cmd, argp);
@@ -1227,25 +1271,25 @@ static int import_ioctl(struct file *filp, void *data)
 	struct virtio_vdmabuf_buf *imp;
 	int ret = 0;
 
-	if (!vdmabuf)
+	if (!vdmabuf || !vdmabuf->active)
 		return -1;
 	mutex_lock(&vdmabuf->dev.mutex);
 
 	/* look for dmabuf for the id */
 	imp = virtio_vdmabuf_find_buf(drv_info, &attr->buf_id);
-	if (!imp || !imp->valid) {
+	if (!imp || !imp->valid || imp->unexport) {
 		mutex_unlock(&vdmabuf->dev.mutex);
-		dev_err(drv_info->dev,
-			"no valid buf found with id = %llu\n", attr->buf_id.id);
+		dev_err(drv_info->dev, "no valid buf found with id = %llu\n",
+			attr->buf_id.id);
 		return -ENOENT;
 	}
 
+	get_vbuf(imp);
 	/* only if mapped pages are not present */
 	if (!imp->pages_info->pages) {
 		ret = vhost_vdmabuf_map_pages(vdmabuf->vmid, imp->pages_info);
 		if (ret < 0) {
-			dev_err(drv_info->dev,
-				"failed to map guest pages\n");
+			dev_err(drv_info->dev, "failed to map guest pages\n");
 			goto fail_map;
 		}
 	}
@@ -1276,6 +1320,7 @@ fail_import:
 	}
 
 fail_map:
+	put_vbuf(imp);
 	/* Check if buffer is still valid and if not remove it
 	 * from imported list.
 	 */
@@ -1286,13 +1331,15 @@ fail_map:
 		kfree(imp);
 	}
 
-	ret =  attr->fd;
+	ret = attr->fd;
+
 	mutex_unlock(&vdmabuf->dev.mutex);
 
 success:
 	return ret;
 }
 
+#if 0
 static int release_ioctl(struct file *filp, void *data)
 {
 	struct virtio_vdmabuf_be *virtio_dmabuf = filp->private_data;
@@ -1326,6 +1373,7 @@ static int release_ioctl(struct file *filp, void *data)
 
 	return 0;
 }
+#endif
 
 static int vm_set_ioctl(struct file *filp, void *data)
 {
@@ -1354,7 +1402,7 @@ static int lmem_ioctl(struct file *filp, void *data)
 	vdmabuf->bar_hva = lmem->hva;
 	vdmabuf->num_pages = DIV_ROUND_UP(vdmabuf->size, PAGE_SIZE);
 
-	chunks =  vdmabuf->num_pages;
+	chunks = vdmabuf->num_pages;
 	bitmap_size = BITS_TO_LONGS(chunks) * sizeof(long);
 	printk("lmem ioctl: chunks:%d\n", chunks);
 	vdmabuf->alloc_bitmap = kzalloc(bitmap_size, GFP_KERNEL);
@@ -1362,15 +1410,15 @@ static int lmem_ioctl(struct file *filp, void *data)
 		return -ENOMEM;
 
 	vdmabuf->pages = kvzalloc(vdmabuf->num_pages * sizeof(struct page *),
-					      GFP_KERNEL);
+				  GFP_KERNEL);
 	if (!vdmabuf->pages) {
 		kfree(vdmabuf->alloc_bitmap);
 		return -ENOMEM;
 	}
-	
-	pinned = pin_user_pages_fast(vdmabuf->bar_hva,
-                            vdmabuf->num_pages, FOLL_WRITE | FOLL_LONGTERM,
-                             vdmabuf->pages);
+
+	pinned = pin_user_pages_fast(vdmabuf->bar_hva, vdmabuf->num_pages,
+				     FOLL_WRITE | FOLL_LONGTERM,
+				     vdmabuf->pages);
 	if (pinned < 0) {
 		kfree(vdmabuf->alloc_bitmap);
 		kfree(vdmabuf->pages);
@@ -1388,8 +1436,8 @@ static int lmem_ioctl(struct file *filp, void *data)
 }
 
 static const struct virtio_vdmabuf_ioctl_desc vhost_vdmabuf_ioctls[] = {
-		VIRTIO_VDMABUF_IOCTL_DEF(VHOST_VDMABUF_SET_ID, vm_set_ioctl, 0),
-		VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_LOCAL_MEM, lmem_ioctl, 0),
+	VIRTIO_VDMABUF_IOCTL_DEF(VHOST_VDMABUF_SET_ID, vm_set_ioctl, 0),
+	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_LOCAL_MEM, lmem_ioctl, 0),
 };
 
 static long vhost_vdmabuf_ioctl(struct file *filp, unsigned int cmd,
@@ -1406,7 +1454,7 @@ static long vhost_vdmabuf_ioctl(struct file *filp, unsigned int cmd,
 		return ret;
 	}
 
-	for(int i = 0; i < ARRAY_SIZE(vhost_vdmabuf_ioctls); i++) {
+	for (int i = 0; i < ARRAY_SIZE(vhost_vdmabuf_ioctls); i++) {
 		ioctl = &vhost_vdmabuf_ioctls[i];
 		if (ioctl->cmd == cmd) {
 			func = ioctl->func;
@@ -1423,18 +1471,15 @@ static long vhost_vdmabuf_ioctl(struct file *filp, unsigned int cmd,
 	if (!kdata)
 		return -ENOMEM;
 
-	if (copy_from_user(kdata, (void __user *)param,
-			   _IOC_SIZE(cmd)) != 0) {
-		dev_err(drv_info->dev,
-			"failed to copy args from userspace\n");
+	if (copy_from_user(kdata, (void __user *)param, _IOC_SIZE(cmd)) != 0) {
+		dev_err(drv_info->dev, "failed to copy args from userspace\n");
 		ret = -EFAULT;
 		goto ioctl_error;
 	}
 
 	ret = func(filp, kdata);
 
-	if (copy_to_user((void __user *)param, kdata,
-			 _IOC_SIZE(cmd)) != 0) {
+	if (copy_to_user((void __user *)param, kdata, _IOC_SIZE(cmd)) != 0) {
 		dev_err(drv_info->dev,
 			"failed to copy args back to userspace\n");
 		ret = -EFAULT;
@@ -1463,7 +1508,8 @@ static int virtio_vdmabuf_be_open(struct inode *inode, struct file *filp)
 {
 	int ret = 0;
 	struct virtio_vdmabuf_be *virtio_dmabuf = NULL;
-	filp->private_data = NULL;;
+	filp->private_data = NULL;
+	;
 	virtio_dmabuf = kzalloc(sizeof(*virtio_dmabuf), GFP_KERNEL);
 	if (!virtio_dmabuf)
 		return -ENOMEM;
@@ -1491,7 +1537,8 @@ static int virtio_vdmabuf_be_release(struct inode *inode, struct file *filp)
 static int attach_ioctl(struct file *filp, void *data)
 {
 	struct virtio_vdmabuf_be *virtio_dmabuf = filp->private_data;
-	struct virtio_vdmabuf_attach *attach = (struct virtio_vdmabuf_attach *)data;
+	struct virtio_vdmabuf_attach *attach =
+		(struct virtio_vdmabuf_attach *)data;
 	if (!attach)
 		return -1;
 	memcpy(virtio_dmabuf->name, attach->name, MAX_VM_NAME_LEN);
@@ -1502,9 +1549,9 @@ static int attach_ioctl(struct file *filp, void *data)
 	return 0;
 }
 
-static struct sg_table
-*virtio_vdmabuf_map_dmabuf(struct dma_buf_attachment *attachment,
-			   enum dma_data_direction dir)
+static struct sg_table *
+virtio_vdmabuf_map_dmabuf(struct dma_buf_attachment *attachment,
+			  enum dma_data_direction dir)
 {
 	struct virtio_vdmabuf_buf *exp_buf;
 	struct sg_table *sgt;
@@ -1560,8 +1607,7 @@ static int virtio_vdmabuf_mmap_dmabuf(struct dma_buf *dmabuf,
 
 	uaddr = vma->vm_start;
 	for (i = 0; i < exp_buf->pages_info->nents; i++) {
-		ret = vm_insert_page(vma, uaddr,
-				     exp_buf->pages_info->pages[i]);
+		ret = vm_insert_page(vma, uaddr, exp_buf->pages_info->pages[i]);
 		if (ret)
 			return ret;
 
@@ -1572,8 +1618,8 @@ static int virtio_vdmabuf_mmap_dmabuf(struct dma_buf *dmabuf,
 }
 
 static void virtio_vdmabuf_unmap_dmabuf(struct dma_buf_attachment *attachment,
-				        struct sg_table *sgt,
-				        enum dma_data_direction dir)
+					struct sg_table *sgt,
+					enum dma_data_direction dir)
 {
 	dma_unmap_sg(attachment->dev, sgt->sgl, sgt->nents, dir);
 
@@ -1588,21 +1634,11 @@ static void virtio_vdmabuf_release_dmabuf(struct dma_buf *dmabuf)
 	unsigned long flags;
 
 	printk("bosheng dmabuf release\n");
-	virtio_vdmabuf_del_buf(drv_info, &exp_buf->buf_id);
-
-	spin_lock_irqsave(&vdmabuf->alloc_lock, flags);
-	bitmap_clear(vdmabuf->alloc_bitmap, exp_buf->pages_info->offset,
-                             exp_buf->pages_info->nents);
-	spin_unlock_irqrestore(&vdmabuf->alloc_lock, flags);						 
-
-	kvfree(exp_buf->pages_info);
-
-	if (exp_buf->sz_priv > 0 && !exp_buf->priv)
-		kvfree(exp_buf->priv);
-	kvfree(exp_buf);
+	//virtio_vdmabuf_del_buf(drv_info, &exp_buf->buf_id);
+	put_vbuf(exp_buf);
 }
 
-static const struct dma_buf_ops virtio_vdmabuf_dmabuf_ops =  {
+static const struct dma_buf_ops virtio_vdmabuf_dmabuf_ops = {
 	.map_dma_buf = virtio_vdmabuf_map_dmabuf,
 	.unmap_dma_buf = virtio_vdmabuf_unmap_dmabuf,
 	.release = virtio_vdmabuf_release_dmabuf,
@@ -1612,11 +1648,11 @@ static const struct dma_buf_ops virtio_vdmabuf_dmabuf_ops =  {
 int find_avail_unused_bar_address(struct vhost_vdmabuf *vdmabuf, int num_pages)
 {
 	unsigned long flags;
-	int chunk  = -ENOMEM;
+	int chunk = -ENOMEM;
 	int ret = -ENOMEM;
 	spin_lock_irqsave(&vdmabuf->alloc_lock, flags);
 	chunk = bitmap_find_next_zero_area(vdmabuf->alloc_bitmap,
-				vdmabuf->num_pages, 0, num_pages, 0);
+					   vdmabuf->num_pages, 0, num_pages, 0);
 	if (chunk < vdmabuf->num_pages) {
 		ret = chunk;
 		bitmap_set(vdmabuf->alloc_bitmap, chunk, num_pages);
@@ -1626,11 +1662,11 @@ int find_avail_unused_bar_address(struct vhost_vdmabuf *vdmabuf, int num_pages)
 }
 
 #define VIRTIO_VDMABUF_MAX_ID INT_MAX
-#define NEW_BUF_ID_GEN(vmid, cnt) (((vmid & 0xFFFFFFFF) << 32) | \
-				    ((cnt) & 0xFFFFFFFF))
+#define NEW_BUF_ID_GEN(vmid, cnt) \
+	(((vmid & 0xFFFFFFFF) << 32) | ((cnt) & 0xFFFFFFFF))
 static virtio_vdmabuf_buf_id_t vhost_get_buf_id(struct vhost_vdmabuf *vdmabuf)
 {
-	virtio_vdmabuf_buf_id_t buf_id = {0, {0, 0} };
+	virtio_vdmabuf_buf_id_t buf_id = { 0, { 0, 0 } };
 	static int count = 0;
 
 	count = count < VIRTIO_VDMABUF_MAX_ID ? count + 1 : 0;
@@ -1643,7 +1679,7 @@ static virtio_vdmabuf_buf_id_t vhost_get_buf_id(struct vhost_vdmabuf *vdmabuf)
 }
 
 static int virtio_vdmabuf_create_dmabuf(struct vhost_vdmabuf *vdmabuf,
-				        uint64_t bo_size)
+					uint64_t bo_size)
 {
 	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
 	struct virtio_vdmabuf_buf *exp_buf;
@@ -1657,18 +1693,18 @@ static int virtio_vdmabuf_create_dmabuf(struct vhost_vdmabuf *vdmabuf,
 		printk("vdmabuf: no availabe space");
 		return -ENOMEM;
 	}
-	
+
 	exp_buf = kvzalloc(sizeof(*exp_buf), GFP_KERNEL);
 	if (!exp_buf)
 		goto err_exp;
-
-	exp_buf->pages_info = kvzalloc(sizeof (*(exp_buf->pages_info)),
-				       GFP_KERNEL);
+	kref_init(&exp_buf->ref);
+	exp_buf->pages_info =
+		kvzalloc(sizeof(*(exp_buf->pages_info)), GFP_KERNEL);
 	if (!exp_buf->pages_info)
 		goto err_pages_info;
 
-	exp_buf->pages_info->pages = kvzalloc(num_pages * sizeof(struct page *),
-					      GFP_KERNEL);
+	exp_buf->pages_info->pages =
+		kvzalloc(num_pages * sizeof(struct page *), GFP_KERNEL);
 	if (!exp_buf->pages_info->pages)
 		goto err_pages;
 
@@ -1677,7 +1713,7 @@ static int virtio_vdmabuf_create_dmabuf(struct vhost_vdmabuf *vdmabuf,
 	exp_info.flags = O_CLOEXEC | O_RDWR;
 	exp_info.priv = exp_buf;
 
-	for(i = 0; i < num_pages; i++) {
+	for (i = 0; i < num_pages; i++) {
 		exp_buf->pages_info->pages[i] = vdmabuf->pages[chunk + i];
 	}
 
@@ -1694,6 +1730,7 @@ static int virtio_vdmabuf_create_dmabuf(struct vhost_vdmabuf *vdmabuf,
 	exp_buf->pages_info->nents = num_pages;
 	exp_buf->pages_info->offset = chunk * PAGE_SIZE;
 	exp_buf->data_priv = vdmabuf;
+	exp_buf->is_export = true;
 
 	virtio_vdmabuf_add_buf(drv_info, exp_buf);
 
@@ -1716,7 +1753,7 @@ static int alloc_ioctl(struct file *filp, void *data)
 	struct virtio_vdmabuf_alloc *attr = data;
 	int ret;
 
-	if(!vdmabuf)
+	if (!vdmabuf || !vdmabuf->active)
 		return -1;
 	ret = virtio_vdmabuf_create_dmabuf(vdmabuf, attr->size);
 	if (ret < 0)
@@ -1760,7 +1797,6 @@ static int export_notify(struct virtio_vdmabuf_buf *exp)
 	/* driver/application specific private info */
 	memcpy(&op[10], exp->priv, op[9]);
 
-	//ret = send_msg_to_host(VIRTIO_VDMABUF_CMD_EXPORT, op);
 	ret = send_msg_to_guest(vdmabuf->vmid, VIRTIO_VDMABUF_CMD_EXPORT, op);
 
 	kvfree(op);
@@ -1775,14 +1811,14 @@ static int export_ioctl(struct file *filp, void *data)
 	struct virtio_vdmabuf_buf *exp;
 	int ret = 0;
 
-	if(!vdmabuf)
+	if (!vdmabuf || !vdmabuf->active)
 		return -1;
 
 	exp = virtio_vdmabuf_find_buf_fd(drv_info, attr->fd);
 	if (!exp)
 		return -EINVAL;
-
-	mutex_lock(&drv_info->g_mutex);
+	get_vbuf(exp);
+	// mutex_lock(&drv_info->g_mutex);
 
 	/* possible truncation */
 	if (attr->sz_priv > MAX_SIZE_PRIV_DATA)
@@ -1793,8 +1829,10 @@ static int export_ioctl(struct file *filp, void *data)
 	/* creating buffer for private data */
 	if (exp->sz_priv != 0) {
 		exp->priv = kvcalloc(1, exp->sz_priv, GFP_KERNEL);
-		if (!exp->priv)
-			return -ENOMEM;
+		if (!exp->priv) {
+			ret = -ENOMEM;
+			goto fail_priv;
+		}
 
 		ret = copy_from_user(exp->priv, attr->priv, exp->sz_priv);
 		if (ret) {
@@ -1803,10 +1841,12 @@ static int export_ioctl(struct file *filp, void *data)
 		}
 	}
 
+
 	ret = virtio_vdmabuf_share_buf(exp);
 	if (ret < 0)
 		goto fail_priv;
 
+	exp->data_priv = vdmabuf;
 	ret = export_notify(exp);
 	if (ret < 0)
 		goto fail_priv;
@@ -1814,28 +1854,74 @@ static int export_ioctl(struct file *filp, void *data)
 	exp->valid = 1;
 	exp->filp = filp;
 	attr->buf_id = exp->buf_id;
+	exp->is_export = true;
+	memcpy(&attr->buf_id, &exp->buf_id, sizeof(virtio_vdmabuf_buf_id_t));
 
-	mutex_unlock(&drv_info->g_mutex);
-
+	// mutex_unlock(&drv_info->g_mutex);
+	
 	return ret;
 
 fail_priv:
-	kvfree(exp->priv);
-	mutex_unlock(&drv_info->g_mutex);
+	if (exp->priv)
+		kvfree(exp->priv);
+	get_vbuf(exp);
+	// mutex_unlock(&drv_info->g_mutex);
 
+	return ret;
+}
+
+static int unexport_ioctl(struct file *filp, void *data)
+{
+	struct virtio_vdmabuf_be *virtio_dmabuf = filp->private_data;
+	struct vhost_vdmabuf *vdmabuf = virtio_dmabuf->vdmabuf;
+	struct virtio_vdmabuf_unexport *attr = data;
+	struct virtio_vdmabuf_buf *exp;
+	int *op;
+	int nents, last_len;
+	int ret = 0;
+
+	if (!vdmabuf || !vdmabuf->active)
+		return -EINVAL;
+
+	exp = virtio_vdmabuf_find_buf(drv_info, &attr->buf_id);
+	if (!exp || !exp->valid) {
+		dev_err(drv_info->dev, "no valid buf found with id = %llu\n",
+			attr->buf_id.id);
+		return -ENOENT;
+	}
+	//put_vbuf(exp);
+	exp->unexport = true;
+	op = kcalloc(1, sizeof(int) * 65, GFP_KERNEL);
+	if (!op)
+		return -ENOMEM;
+
+	memcpy(op, &exp->buf_id, sizeof(exp->buf_id));
+
+	ret = send_msg_to_guest(vdmabuf->vmid,
+				VIRTIO_VDMABUF_CMD_DMABUF_UNEXPORT, op);
+	if (ret < 0) {
+		dev_err(drv_info->dev, "fail to send unexport cmd\n");
+		kfree(op);
+		return ret;
+	}
+	kfree(op);
+	//virtio_vdmabuf_del_buf(drv_info, &exp->buf_id);
+	
 	return ret;
 }
 
 static const struct virtio_vdmabuf_ioctl_desc virtio_vdmabuf_be_ioctls[] = {
 	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_ATTACH, attach_ioctl, 0),
 	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_IMPORT, import_ioctl, 0),
-	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_RELEASE, release_ioctl, 0),
+	//	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_RELEASE, release_ioctl, 0),
 	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_ALLOC_FD, alloc_ioctl, 0),
 	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_EXPORT, export_ioctl, 0),
+	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_UNEXPORT, unexport_ioctl,
+				 0),
 };
 
 static long virtio_vdmabuf_be_ioctl(struct file *filp, unsigned int cmd,
-				unsigned long param)
+				    unsigned long param)
 {
 	const struct virtio_vdmabuf_ioctl_desc *ioctl = NULL;
 	virtio_vdmabuf_ioctl_t func;
@@ -1843,7 +1929,7 @@ static long virtio_vdmabuf_be_ioctl(struct file *filp, unsigned int cmd,
 	int ret;
 	char *kdata;
 
-	for(int i = 0; i < ARRAY_SIZE(virtio_vdmabuf_be_ioctls); i++) {
+	for (int i = 0; i < ARRAY_SIZE(virtio_vdmabuf_be_ioctls); i++) {
 		ioctl = &virtio_vdmabuf_be_ioctls[i];
 		if (ioctl->cmd == cmd) {
 			func = ioctl->func;
@@ -1860,18 +1946,15 @@ static long virtio_vdmabuf_be_ioctl(struct file *filp, unsigned int cmd,
 	if (!kdata)
 		return -ENOMEM;
 
-	if (copy_from_user(kdata, (void __user *)param,
-			   _IOC_SIZE(cmd)) != 0) {
-		dev_err(drv_info->dev,
-			"failed to copy args from userspace\n");
+	if (copy_from_user(kdata, (void __user *)param, _IOC_SIZE(cmd)) != 0) {
+		dev_err(drv_info->dev, "failed to copy args from userspace\n");
 		ret = -EFAULT;
 		goto ioctl_error;
 	}
 
 	ret = func(filp, kdata);
 
-	if (copy_to_user((void __user *)param, kdata,
-			 _IOC_SIZE(cmd)) != 0) {
+	if (copy_to_user((void __user *)param, kdata, _IOC_SIZE(cmd)) != 0) {
 		dev_err(drv_info->dev,
 			"failed to copy args back to userspace\n");
 		ret = -EFAULT;
@@ -1904,7 +1987,8 @@ static int __init vhost_vdmabuf_init(void)
 
 	ret = misc_register(&vhost_vdmabuf_miscdev);
 	if (ret) {
-		pr_err("vhost-vdmabuf: driver can't be registered, ret:%d\n", ret);
+		pr_err("vhost-vdmabuf: driver can't be registered, ret:%d\n",
+		       ret);
 		return ret;
 	}
 
@@ -1920,7 +2004,7 @@ static int __init vhost_vdmabuf_init(void)
 	drv_info->dev = vhost_vdmabuf_miscdev.this_device;
 
 	hash_init(drv_info->buf_list);
-	mutex_init(&drv_info->g_mutex);
+	// mutex_init(&drv_info->g_mutex);
 	spin_lock_init(&drv_info->vdmabuf_instances_lock);
 	INIT_LIST_HEAD(&drv_info->head_vdmabuf_list);
 	INIT_LIST_HEAD(&drv_info->vm_instances);
@@ -1931,7 +2015,8 @@ static int __init vhost_vdmabuf_init(void)
 
 	ret = misc_register(&virtio_vdmabuf_be_miscdev);
 	if (ret) {
-		pr_err("virtio-vdmabuf: driver can't be registered, ret:%d\n", ret);
+		pr_err("virtio-vdmabuf: driver can't be registered, ret:%d\n",
+		       ret);
 		acrn_vm_unregister_notifier(&drv_info->acrn_notifier);
 		misc_deregister(&vhost_vdmabuf_miscdev);
 		kfree(drv_info);
