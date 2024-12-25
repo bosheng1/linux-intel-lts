@@ -237,4 +237,8 @@ void *acrn_get_hva(struct acrn_vm *vm, u64 gpa);
 
 struct page *acrn_get_page(struct acrn_vm *vm, u64 gpa);
 
+int acrn_vm_map(struct acrn_vm *vm, struct page **pages, u64 user_vm_pa, u64 nr_pages);
+
+int acrn_vm_unmap(struct acrn_vm *vm, u64 user_vm_pa, u64 len);
+
 #endif /* __ACRN_HSM_DRV_H */

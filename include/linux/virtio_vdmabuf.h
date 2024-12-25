@@ -68,6 +68,7 @@ struct virtio_vdmabuf_buf {
 	bool valid;
 
 	bool is_export;
+	bool bar_mapped;
 	/* set if the buffer is imported via import_ioctl */
 	bool imported;
 

@@ -271,6 +271,8 @@ static void vbuf_free(struct kref *kref)
 		bitmap_clear(vdmabuf->alloc_bitmap, vbuf->pages_info->ref,
 			     vbuf->pages_info->nents);
 		spin_unlock_irqrestore(&vdmabuf->alloc_lock, flags);
+		acrn_vm_unmap(vdmabuf->acrn, vdmabuf->bar_gpa + vbuf->pages_info->ref * PAGE_SIZE,
+											vbuf->pages_info->nents * PAGE_SIZE);
 	}
 	if (vbuf->pages_info)
 		kvfree(vbuf->pages_info);
@@ -281,14 +283,14 @@ static void vbuf_free(struct kref *kref)
 
 static void get_vbuf(struct virtio_vdmabuf_buf *vbuf)
 {
-	printk("bosheng get vbuf:%p, count:%d\n",vbuf, kref_read(&vbuf->ref));
+	printk("bosheng get vbuf:%p, count:%d\n", vbuf, kref_read(&vbuf->ref));
 	if (vbuf) {
 		kref_get(&vbuf->ref);
 	}
 }
 static void put_vbuf(struct virtio_vdmabuf_buf *vbuf)
 {
-	printk("bosheng put vbuf:%p, count:%d\n",vbuf, kref_read(&vbuf->ref));
+	printk("bosheng put vbuf:%p, count:%d\n", vbuf, kref_read(&vbuf->ref));
 	if (vbuf) {
 		kref_put(&vbuf->ref, vbuf_free);
 	}
@@ -1393,7 +1395,7 @@ static int lmem_ioctl(struct file *filp, void *data)
 	struct vhost_vdmabuf *vdmabuf = filp->private_data;
 	struct virtio_vdmabuf_lmem *lmem = data;
 	int chunks, bitmap_size;
-	int pinned;
+	//	int pinned;
 
 	if (!lmem || !vdmabuf)
 		return -1;
@@ -1409,29 +1411,29 @@ static int lmem_ioctl(struct file *filp, void *data)
 	if (!vdmabuf->alloc_bitmap)
 		return -ENOMEM;
 
-	vdmabuf->pages = kvzalloc(vdmabuf->num_pages * sizeof(struct page *),
-				  GFP_KERNEL);
-	if (!vdmabuf->pages) {
-		kfree(vdmabuf->alloc_bitmap);
-		return -ENOMEM;
-	}
+	// vdmabuf->pages = kvzalloc(vdmabuf->num_pages * sizeof(struct page *),
+	// 			  GFP_KERNEL);
+	// if (!vdmabuf->pages) {
+	// 	kfree(vdmabuf->alloc_bitmap);
+	// 	return -ENOMEM;
+	// }
 
-	pinned = pin_user_pages_fast(vdmabuf->bar_hva, vdmabuf->num_pages,
-				     FOLL_WRITE | FOLL_LONGTERM,
-				     vdmabuf->pages);
-	if (pinned < 0) {
-		kfree(vdmabuf->alloc_bitmap);
-		kfree(vdmabuf->pages);
-		vdmabuf->num_pages = 0;
-		return -ENOMEM;
-	} else if (pinned != vdmabuf->num_pages) {
-		for (int j = 0; j < pinned; j++)
-			unpin_user_page(vdmabuf->pages[j]);
-		kfree(vdmabuf->alloc_bitmap);
-		kfree(vdmabuf->pages);
-		vdmabuf->num_pages = 0;
-		return -ENOMEM;
-	}
+	// pinned = pin_user_pages_fast(vdmabuf->bar_hva, vdmabuf->num_pages,
+	// 			     FOLL_WRITE | FOLL_LONGTERM,
+	// 			     vdmabuf->pages);
+	// if (pinned < 0) {
+	// 	kfree(vdmabuf->alloc_bitmap);
+	// 	kfree(vdmabuf->pages);
+	// 	vdmabuf->num_pages = 0;
+	// 	return -ENOMEM;
+	// } else if (pinned != vdmabuf->num_pages) {
+	// 	for (int j = 0; j < pinned; j++)
+	// 		unpin_user_page(vdmabuf->pages[j]);
+	// 	kfree(vdmabuf->alloc_bitmap);
+	// 	kfree(vdmabuf->pages);
+	// 	vdmabuf->num_pages = 0;
+	// 	return -ENOMEM;
+	// }
 	return 0;
 }
 
@@ -1685,14 +1687,7 @@ static int virtio_vdmabuf_create_dmabuf(struct vhost_vdmabuf *vdmabuf,
 	struct virtio_vdmabuf_buf *exp_buf;
 	struct dma_buf *dmabuf;
 	uint32_t num_pages = DIV_ROUND_UP(bo_size, PAGE_SIZE);
-	int i, ret;
-	int chunk;
-
-	chunk = find_avail_unused_bar_address(vdmabuf, num_pages);
-	if (chunk < 0) {
-		printk("vdmabuf: no availabe space");
-		return -ENOMEM;
-	}
+	int i, j, ret;
 
 	exp_buf = kvzalloc(sizeof(*exp_buf), GFP_KERNEL);
 	if (!exp_buf)
@@ -1709,33 +1704,37 @@ static int virtio_vdmabuf_create_dmabuf(struct vhost_vdmabuf *vdmabuf,
 		goto err_pages;
 
 	exp_info.ops = &virtio_vdmabuf_dmabuf_ops;
-	exp_info.size = bo_size;
+	exp_info.size = num_pages * PAGE_SIZE;
 	exp_info.flags = O_CLOEXEC | O_RDWR;
 	exp_info.priv = exp_buf;
 
 	for (i = 0; i < num_pages; i++) {
-		exp_buf->pages_info->pages[i] = vdmabuf->pages[chunk + i];
+		exp_buf->pages_info->pages[i] =
+			alloc_page(GFP_KERNEL | __GFP_ZERO);
+		if (!exp_buf->pages_info->pages[i])
+			goto err_alloc;
 	}
 
 	dmabuf = dma_buf_export(&exp_info);
 	if (IS_ERR_OR_NULL(dmabuf))
-		goto err_pages;
+		goto err_alloc;
 
 	ret = dma_buf_fd(dmabuf, 0);
 	if (ret < 0)
-		goto err_pages;
+		goto err_alloc;
 
 	exp_buf->fd = ret;
-	exp_buf->buf_id = vhost_get_buf_id(vdmabuf);
+	//	exp_buf->buf_id = vhost_get_buf_id(vdmabuf);
 	exp_buf->pages_info->nents = num_pages;
-	exp_buf->pages_info->offset = chunk * PAGE_SIZE;
-	exp_buf->data_priv = vdmabuf;
 	exp_buf->is_export = true;
 
-	virtio_vdmabuf_add_buf(drv_info, exp_buf);
+	//	virtio_vdmabuf_add_buf(drv_info, exp_buf);
 
 	return ret;
 
+err_alloc:
+	for (j = 0; j < i; j++)
+		put_page(exp_buf->pages_info->pages[i]);
 err_pages:
 	kvfree(exp_buf->pages_info->pages);
 err_pages_info:
@@ -1762,15 +1761,6 @@ static int alloc_ioctl(struct file *filp, void *data)
 	attr->fd = ret;
 
 	return ret;
-}
-
-static int virtio_vdmabuf_share_buf(struct virtio_vdmabuf_buf *exp)
-{
-	struct virtio_vdmabuf_shared_pages *pages_info = exp->pages_info;
-
-	pages_info->ref = pages_info->offset;
-
-	return 0;
 }
 
 static int export_notify(struct virtio_vdmabuf_buf *exp)
@@ -1803,23 +1793,133 @@ static int export_notify(struct virtio_vdmabuf_buf *exp)
 	return ret;
 }
 
+static int num_pgs(struct sg_table *sgt)
+{
+	struct scatterlist *sgl;
+	int len, i;
+	/* at least one page */
+	int n_pgs = 1;
+
+	sgl = sgt->sgl;
+
+	len = sgl->length - PAGE_SIZE + sgl->offset;
+
+	/* round-up */
+	n_pgs += ((len + PAGE_SIZE - 1) / PAGE_SIZE);
+
+	for (i = 1; i < sgt->nents; i++) {
+		sgl = sg_next(sgl);
+
+		/* round-up */
+		n_pgs += ((sgl->length + PAGE_SIZE - 1) /
+			  PAGE_SIZE); /* round-up */
+	}
+
+	return n_pgs;
+}
+
+static struct page **extr_pgs(struct sg_table *sgt, int *nents, int *last_len)
+{
+	struct scatterlist *sgl;
+	struct page **pages;
+	struct page **temp_pgs;
+	int i, j;
+	int len;
+
+	*nents = num_pgs(sgt);
+	pages = kvmalloc_array(*nents, sizeof(struct page *), GFP_KERNEL);
+	if (!pages)
+		return NULL;
+
+	sgl = sgt->sgl;
+
+	temp_pgs = pages;
+	*temp_pgs++ = sg_page(sgl);
+	len = sgl->length - PAGE_SIZE + sgl->offset;
+
+	i = 1;
+	while (len > 0) {
+		*temp_pgs++ = nth_page(sg_page(sgl), i++);
+		len -= PAGE_SIZE;
+	}
+
+	for (i = 1; i < sgt->nents; i++) {
+		sgl = sg_next(sgl);
+		*temp_pgs++ = sg_page(sgl);
+		len = sgl->length - PAGE_SIZE;
+		j = 1;
+
+		while (len > 0) {
+			*temp_pgs++ = nth_page(sg_page(sgl), j++);
+			len -= PAGE_SIZE;
+		}
+	}
+
+	*last_len = len + PAGE_SIZE;
+
+	return pages;
+}
+
 static int export_ioctl(struct file *filp, void *data)
 {
 	struct virtio_vdmabuf_be *virtio_dmabuf = filp->private_data;
 	struct vhost_vdmabuf *vdmabuf = virtio_dmabuf->vdmabuf;
 	struct virtio_vdmabuf_export *attr = data;
 	struct virtio_vdmabuf_buf *exp;
+	uint32_t num_pages;
+	struct dma_buf *dmabuf;
+	struct dma_buf_attachment *attach;
+	struct sg_table *sgt;
+	struct page **pages;
+	int chunk, nents;
+	int last_len;
 	int ret = 0;
+	virtio_vdmabuf_buf_id_t buf_id;
+	unsigned long flags;
+	u64 user_vm_pa;
 
-	if (!vdmabuf || !vdmabuf->active)
-		return -1;
-
-	exp = virtio_vdmabuf_find_buf_fd(drv_info, attr->fd);
-	if (!exp)
+	if (!vdmabuf || !vdmabuf->acrn || !vdmabuf->active)
 		return -EINVAL;
-	get_vbuf(exp);
-	// mutex_lock(&drv_info->g_mutex);
 
+	dmabuf = dma_buf_get(attr->fd);
+	if (!dmabuf)
+		return -EINVAL;
+	if (dmabuf->size % PAGE_SIZE) {
+		dma_buf_put(dmabuf);
+		printk("dmabuf size is page aligned\n");
+		return -EINVAL;
+	}
+	num_pages = dmabuf->size >> PAGE_SHIFT;
+
+	chunk = find_avail_unused_bar_address(vdmabuf, num_pages);
+	if (chunk < 0) {
+		printk("vdmabuf: no availabe space");
+		dma_buf_put(dmabuf);
+		return -ENOMEM;
+	}
+	buf_id = vhost_get_buf_id(vdmabuf);
+	attach = dma_buf_attach(dmabuf, drv_info->dev);
+	if (IS_ERR(attach)) {
+		ret = PTR_ERR(attach);
+		goto fail_attach;
+	}
+	sgt = dma_buf_map_attachment(attach, DMA_BIDIRECTIONAL);
+	if (IS_ERR(sgt)) {
+		ret = PTR_ERR(sgt);
+		goto fail_map_attachment;
+	}
+	if (sgt->sgl->offset) {
+		ret = -EINVAL;
+		printk("dmabuf start addr is page aligned\n");
+		goto fail_sgt_info_creation;
+	}
+
+	exp = kvcalloc(1, sizeof(*exp), GFP_KERNEL);
+	if (!exp) {
+		ret = -ENOMEM;
+		goto fail_sgt_info_creation;
+	}
+	kref_init(&exp->ref);
 	/* possible truncation */
 	if (attr->sz_priv > MAX_SIZE_PRIV_DATA)
 		exp->sz_priv = MAX_SIZE_PRIV_DATA;
@@ -1831,42 +1931,91 @@ static int export_ioctl(struct file *filp, void *data)
 		exp->priv = kvcalloc(1, exp->sz_priv, GFP_KERNEL);
 		if (!exp->priv) {
 			ret = -ENOMEM;
-			goto fail_priv;
+			goto fail_priv_creation;
 		}
+	}
+	exp->buf_id = buf_id;
+	exp->attach = attach;
+	exp->sgt = sgt;
+	exp->dma_buf = dmabuf;
+	exp->valid = 1;
 
+	if (exp->sz_priv) {
+		/* copy private data to sgt_info */
 		ret = copy_from_user(exp->priv, attr->priv, exp->sz_priv);
 		if (ret) {
 			ret = -EINVAL;
-			goto fail_priv;
+			goto fail_exp;
 		}
 	}
 
+	pages = extr_pgs(sgt, &nents, &last_len);
+	if (pages == NULL) {
+		ret = -ENOMEM;
+		goto fail_exp;
+	}
 
-	ret = virtio_vdmabuf_share_buf(exp);
-	if (ret < 0)
-		goto fail_priv;
+	exp->pages_info = kvcalloc(
+		1, sizeof(struct virtio_vdmabuf_shared_pages), GFP_KERNEL);
+	if (!exp->pages_info) {
+		ret = -ENOMEM;
+		goto fail_create_pages_info;
+	}
+
+	exp->pages_info->pages = pages;
+	exp->pages_info->nents = nents;
+	exp->pages_info->ref = chunk;
+
+	user_vm_pa = vdmabuf->bar_gpa + chunk * PAGE_SIZE;
+	ret = acrn_vm_map(vdmabuf->acrn, pages, user_vm_pa, nents);
+	if (ret < 0) {
+		ret = -ENOMEM;
+		goto fail_acrn_map;
+	}
 
 	exp->data_priv = vdmabuf;
 	ret = export_notify(exp);
 	if (ret < 0)
-		goto fail_priv;
+		goto fail_send_request;
 
-	exp->valid = 1;
-	exp->filp = filp;
-	attr->buf_id = exp->buf_id;
 	exp->is_export = true;
+	exp->bar_mapped = true;
+	exp->filp = filp;
 	memcpy(&attr->buf_id, &exp->buf_id, sizeof(virtio_vdmabuf_buf_id_t));
-
+	virtio_vdmabuf_add_buf(drv_info, exp);
+	//get_vbuf(exp);
 	// mutex_unlock(&drv_info->g_mutex);
-	
+
 	return ret;
 
-fail_priv:
-	if (exp->priv)
-		kvfree(exp->priv);
-	get_vbuf(exp);
-	// mutex_unlock(&drv_info->g_mutex);
+fail_send_request:
+	acrn_vm_unmap(vdmabuf->acrn, user_vm_pa, exp->pages_info->nents * PAGE_SIZE);
 
+fail_acrn_map:
+	kvfree(exp->pages_info);
+
+fail_create_pages_info:
+	kvfree(pages);
+
+fail_exp:
+	kvfree(exp->priv);
+
+fail_priv_creation:
+	kvfree(exp);
+
+fail_sgt_info_creation:
+	dma_buf_unmap_attachment(attach, sgt, DMA_BIDIRECTIONAL);
+
+fail_map_attachment:
+	dma_buf_detach(dmabuf, attach);
+
+fail_attach:
+	spin_lock_irqsave(&vdmabuf->alloc_lock, flags);
+	bitmap_clear(vdmabuf->alloc_bitmap, chunk, num_pages);
+	spin_unlock_irqrestore(&vdmabuf->alloc_lock, flags);
+	dma_buf_put(dmabuf);
+
+	// mutex_unlock(&drv_info->g_mutex);
 	return ret;
 }
 
@@ -1906,7 +2055,7 @@ static int unexport_ioctl(struct file *filp, void *data)
 	}
 	kfree(op);
 	//virtio_vdmabuf_del_buf(drv_info, &exp->buf_id);
-	
+
 	return ret;
 }
 

@@ -999,6 +999,7 @@ static int export_ioctl(struct file *filp, void *data)
 
 fail_send_request:
 	virtio_vdmabuf_free_buf(exp->pages_info);
+	kvfree(exp->pages_info);
 
 fail_create_pages_info:
 	kvfree(pages);
@@ -1517,7 +1518,7 @@ static int virtio_vdmabuf_probe(struct virtio_device *vdev)
 				    vdmabuf->host_visible_region.len);
 		if (addr) {
 			vdmabuf->bar_addr = (uint64_t)addr;
-			printk("host visiable addr:%p remap addr:%p + %lld\n",  vdmabuf->host_visible_region.addr, addr,
+			printk("host visiable addr:%llx remap addr:%p + %lld\n",  vdmabuf->host_visible_region.addr, addr,
 			       vdmabuf->host_visible_region.len);
 		}
 	} else {
