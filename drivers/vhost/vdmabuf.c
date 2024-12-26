@@ -101,19 +101,26 @@ static inline void vhost_vdmabuf_add(struct vhost_vdmabuf *new)
 static inline struct vhost_vdmabuf *vhost_vdmabuf_find(u64 vmid)
 {
 	struct vhost_vdmabuf *found = NULL;
+	bool hit = false;
 	unsigned long flags;
 	spin_lock_irqsave(&drv_info->vdmabuf_instances_lock, flags);
 	list_for_each_entry(found, &drv_info->head_vdmabuf_list, list)
-		if (found->vmid == vmid)
+		if (found->vmid == vmid) {
+			hit = true;
 			break;
+		}
 	spin_unlock_irqrestore(&drv_info->vdmabuf_instances_lock, flags);
-	return found;
+	if (hit)
+		return found;
+	else
+		return NULL;
 }
 
 static inline struct vhost_vdmabuf *
 vhost_vdmabuf_bind(struct virtio_vdmabuf_be *virtio_dmabuf)
 {
 	struct vhost_vdmabuf *found = NULL;
+	bool hit = false;
 	unsigned long flags;
 	if (!virtio_dmabuf)
 		return found;
@@ -124,13 +131,15 @@ vhost_vdmabuf_bind(struct virtio_vdmabuf_be *virtio_dmabuf)
 		    found->virtio_dmabuf == NULL) {
 			found->virtio_dmabuf = virtio_dmabuf;
 			kref_get(&found->ref);
+			hit = true;
 			break;
 		}
 	spin_unlock_irqrestore(&drv_info->vdmabuf_instances_lock, flags);
-	if (found) {
-		printk("attach success\n");
+	if (hit) {
+		printk("vdmabuf: bind success\n");
+		return found;
 	}
-	return found;
+	return NULL;
 }
 
 static inline bool vhost_vdmabuf_del(struct vhost_vdmabuf *vdmabuf)
@@ -1523,7 +1532,6 @@ static int virtio_vdmabuf_be_open(struct inode *inode, struct file *filp)
 	int ret = 0;
 	struct virtio_vdmabuf_be *virtio_dmabuf = NULL;
 	filp->private_data = NULL;
-	;
 	virtio_dmabuf = kzalloc(sizeof(*virtio_dmabuf), GFP_KERNEL);
 	if (!virtio_dmabuf)
 		return -ENOMEM;
@@ -1676,8 +1684,13 @@ static void virtio_vdmabuf_release_dmabuf(struct dma_buf *dmabuf)
 	struct virtio_vdmabuf_buf *exp_buf = dmabuf->priv;
 	struct vhost_vdmabuf *vdmabuf = exp_buf->data_priv;
 	unsigned long flags;
+	int i = 0;
 
 	printk("bosheng dmabuf release\n");
+	if (exp_buf->pages_info->pages) {
+		for (i = 0; i < exp_buf->pages_info->nents; i++)
+			put_page(exp_buf->pages_info->pages[i]);
+	}
 	//virtio_vdmabuf_del_buf(drv_info, &exp_buf->buf_id);
 	put_vbuf(exp_buf);
 }
