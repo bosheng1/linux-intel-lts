@@ -763,8 +763,36 @@ static int virtio_vdmabuf_open(struct inode *inode, struct file *filp)
 	return 0;
 }
 
+static void virtio_vdmabuf_unexport_exported_buf(struct virtio_vdmabuf_info *info,
+					 struct file *filp)
+{
+	struct virtio_vdmabuf_buf *found = NULL;
+	unsigned long flags;
+	int i = 0;
+	int op[65] = {0};
+	int ret = 0;
+	if (!info)
+		return;
+	spin_lock_irqsave(&info->buf_list_lock, flags);
+
+	hash_for_each(info->buf_list, i, found, node) {
+		if (found->filp == filp && !found->unexport) {
+			found->unexport = true;
+			memcpy(op, &found->buf_id, sizeof(found->buf_id));
+			spin_unlock_irqrestore(&info->buf_list_lock, flags);
+			ret = send_msg_to_host(VIRTIO_VDMABUF_CMD_DMABUF_UNEXPORT, op);
+			if (ret < 0) {
+				dev_err(drv_info->dev, "fail to send unexport cmd\n");
+			}
+			spin_lock_irqsave(&info->buf_list_lock, flags);
+		}
+	}
+	spin_unlock_irqrestore(&info->buf_list_lock, flags);
+}
+
 static int virtio_vdmabuf_release(struct inode *inode, struct file *filp)
 {
+	virtio_vdmabuf_unexport_exported_buf(drv_info, filp);
 	return 0;
 }
 
@@ -983,6 +1011,7 @@ static int export_ioctl(struct file *filp, void *data)
 		goto fail_create_pages_info;
 	}
 
+	exp->data_priv = vdmabuf;
 	ret = export_notify(exp);
 	if (ret < 0)
 		goto fail_send_request;
@@ -991,7 +1020,6 @@ static int export_ioctl(struct file *filp, void *data)
 	memcpy(&attr->buf_id, &exp->buf_id, sizeof(virtio_vdmabuf_buf_id_t));
 	virtio_vdmabuf_add_buf(drv_info, exp);
 	exp->filp = filp;
-	exp->data_priv = vdmabuf;
 	//get_vbuf(exp);
 	// mutex_unlock(&drv_info->g_mutex);
 

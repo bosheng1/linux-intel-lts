@@ -263,16 +263,28 @@ static void vbuf_free(struct kref *kref)
 	printk("bosheng dmabuf free:%p, is_export:%d\n",vbuf, vbuf->is_export);
 	vdmabuf = vbuf->data_priv;
 	virtio_vdmabuf_del_buf(drv_info, &vbuf->buf_id);
-	if (!vbuf->is_export) {
+	if (vbuf->is_export) {
+		if (vbuf->attach)
+			dma_buf_unmap_attachment(vbuf->attach, vbuf->sgt,
+						 DMA_BIDIRECTIONAL);
+
+		if (vbuf->dma_buf && vbuf->attach) {
+			dma_buf_detach(vbuf->dma_buf, vbuf->attach);
+			dma_buf_put(vbuf->dma_buf);
+			vbuf->dma_buf = NULL;
+			vbuf->attach = NULL;
+		}
+		if (vbuf->bar_mapped) {
+			spin_lock_irqsave(&vdmabuf->alloc_lock, flags);
+			bitmap_clear(vdmabuf->alloc_bitmap, vbuf->pages_info->ref,
+				     vbuf->pages_info->nents);
+			spin_unlock_irqrestore(&vdmabuf->alloc_lock, flags);
+			acrn_vm_unmap(vdmabuf->acrn, vdmabuf->bar_gpa + vbuf->pages_info->ref * PAGE_SIZE,
+											vbuf->pages_info->nents * PAGE_SIZE);
+		}
+	} else {
 		send_release_msg(vbuf);
 		vhost_vdmabuf_unmap_pages(vbuf->vmid, vbuf->pages_info);
-	} else {
-		spin_lock_irqsave(&vdmabuf->alloc_lock, flags);
-		bitmap_clear(vdmabuf->alloc_bitmap, vbuf->pages_info->ref,
-			     vbuf->pages_info->nents);
-		spin_unlock_irqrestore(&vdmabuf->alloc_lock, flags);
-		acrn_vm_unmap(vdmabuf->acrn, vdmabuf->bar_gpa + vbuf->pages_info->ref * PAGE_SIZE,
-											vbuf->pages_info->nents * PAGE_SIZE);
 	}
 	if (vbuf->pages_info)
 		kvfree(vbuf->pages_info);
@@ -1520,6 +1532,36 @@ static int virtio_vdmabuf_be_open(struct inode *inode, struct file *filp)
 	return ret;
 }
 
+static void virtio_vdmabuf_unexport_exported_buf(struct virtio_vdmabuf_info *info,
+					 struct file *filp)
+{
+	struct virtio_vdmabuf_buf *found = NULL;
+	unsigned long flags;
+	struct vhost_vdmabuf *vdmabuf;
+	int i = 0;
+	int ret = 0;
+	int op[65] = {0};
+	if (!info)
+		return;
+	spin_lock_irqsave(&info->buf_list_lock, flags);
+
+	hash_for_each(info->buf_list, i, found, node) {
+		if (found->filp == filp && !found->unexport && found->data_priv) {
+			found->unexport = true;
+			memcpy(op, &found->buf_id, sizeof(found->buf_id));
+			vdmabuf = found->data_priv;
+			spin_unlock_irqrestore(&info->buf_list_lock, flags);
+			ret = send_msg_to_guest(vdmabuf->vmid,
+					VIRTIO_VDMABUF_CMD_DMABUF_UNEXPORT, op);
+			if (ret < 0) {
+				dev_err(drv_info->dev, "fail to send unexport cmd\n");
+			}
+			spin_lock_irqsave(&info->buf_list_lock, flags);
+		}
+	}
+	spin_unlock_irqrestore(&info->buf_list_lock, flags);
+}
+
 static int virtio_vdmabuf_be_release(struct inode *inode, struct file *filp)
 {
 	int ret = 0;
@@ -1527,7 +1569,7 @@ static int virtio_vdmabuf_be_release(struct inode *inode, struct file *filp)
 	virtio_dmabuf = filp->private_data;
 	if (!virtio_dmabuf)
 		return ret;
-
+	virtio_vdmabuf_unexport_exported_buf(drv_info, filp);
 	if (virtio_dmabuf->vdmabuf) {
 		virtio_dmabuf->vdmabuf->virtio_dmabuf = NULL;
 		put_vhost_vdmabuf(virtio_dmabuf->vdmabuf);
