@@ -221,6 +221,7 @@ static int send_release_msg(struct virtio_vdmabuf_buf *vbuf)
 
 	ret = send_msg_to_guest(vdmabuf->vmid, VIRTIO_VDMABUF_CMD_DMABUF_REL,
 				op);
+	kfree(op);
 	if (ret < 0) {
 		dev_err(drv_info->dev, "fail to send release cmd\n");
 		return ret;
@@ -1389,6 +1390,7 @@ static int release_ioctl(struct file *filp, void *data)
 
 	ret = send_msg_to_guest(vdmabuf->vmid, VIRTIO_VDMABUF_CMD_DMABUF_REL,
 				op);
+	kfree(op);
 	if (ret < 0) {
 		dev_err(drv_info->dev, "fail to send release cmd\n");
 		return ret;
@@ -2114,14 +2116,43 @@ static int unexport_ioctl(struct file *filp, void *data)
 	return ret;
 }
 
+static int query_ioctl(struct file *filp, void *data)
+{
+	struct virtio_vdmabuf_query_bufinfo *attr = data;
+	struct virtio_vdmabuf_buf *exp;
+	int ret = 0;
+
+	exp = virtio_vdmabuf_find_buf(drv_info, &attr->buf_id);
+	if (!exp || !exp->valid) {
+		dev_err(drv_info->dev, "no valid buf found with id = %llu\n",
+			attr->buf_id.id);
+		return -ENOENT;
+	}
+	if (attr->subcmd == VIRTIO_VDMABUF_QUERY_SIZE) {
+		attr->info = exp->size;
+	} else if (attr->subcmd == VIRTIO_VDMABUF_QUERY_PRIV_INFO_SIZE) {
+		attr->info = exp->sz_priv;
+	} else if (attr->subcmd == VIRTIO_VDMABUF_QUERY_PRIV_INFO) {
+		if (!access_ok((void __user *)attr->info, exp->sz_priv)) {
+			printk("query ioctl, addr is not usable\n");
+			return -EINVAL;
+		}
+		if (copy_to_user((void __user *)attr->info, exp->priv, exp->sz_priv)) {
+			printk("query ioctl, copy to user failure\n");
+			return -EFAULT;
+		}
+	}
+	return 0;
+}
+
 static const struct virtio_vdmabuf_ioctl_desc virtio_vdmabuf_be_ioctls[] = {
 	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_ATTACH, attach_ioctl, 0),
 	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_IMPORT, import_ioctl, 0),
 	//	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_RELEASE, release_ioctl, 0),
 	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_ALLOC_FD, alloc_ioctl, 0),
 	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_EXPORT, export_ioctl, 0),
-	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_UNEXPORT, unexport_ioctl,
-				 0),
+	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_UNEXPORT, unexport_ioctl, 0),
+	VIRTIO_VDMABUF_IOCTL_DEF(VIRTIO_VDMABUF_IOCTL_QUERY_BUFINFO, query_ioctl, 0),
 };
 
 static long virtio_vdmabuf_be_ioctl(struct file *filp, unsigned int cmd,

@@ -117,4 +117,20 @@ struct virtio_vdmabuf_unexport {
 	virtio_vdmabuf_buf_id_t buf_id;
 };
 
+#define VIRTIO_VDMABUF_IOCTL_QUERY_BUFINFO \
+_IOC(_IOC_NONE, 'G', 10, sizeof(struct virtio_vdmabuf_query_bufinfo))
+struct virtio_vdmabuf_query_bufinfo {
+	/* IN parameters */
+	virtio_vdmabuf_buf_id_t buf_id;
+	int subcmd;
+	/* OUT parameters */
+	unsigned long info;
+};
+
+/* DMABUF query */
+enum virtio_vdmabuf_query_cmd {
+	VIRTIO_VDMABUF_QUERY_SIZE = 0x10,
+	VIRTIO_VDMABUF_QUERY_PRIV_INFO_SIZE,
+	VIRTIO_VDMABUF_QUERY_PRIV_INFO,
+};
 #endif
