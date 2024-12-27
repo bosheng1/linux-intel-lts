@@ -263,6 +263,30 @@ virtio_vdmabuf_find_buf(struct virtio_vdmabuf_info *info,
 	return found;
 }
 
+/* find buf for given vdmabuf ID */
+static inline struct virtio_vdmabuf_buf *
+virtio_vdmabuf_find_and_get_buf(struct virtio_vdmabuf_info *info,
+			virtio_vdmabuf_buf_id_t *buf_id)
+{
+	struct virtio_vdmabuf_buf *found = NULL;
+	bool hit = false;
+	unsigned long flags;
+	spin_lock_irqsave(&info->buf_list_lock, flags);
+
+	hash_for_each_possible(info->buf_list, found, node, buf_id->id)
+		if (is_same_buf(found->buf_id, *buf_id)) {
+			if (kref_get_unless_zero(&found->ref)) {
+				hit = true;
+				break;
+			}
+		}
+	spin_unlock_irqrestore(&info->buf_list_lock, flags);
+	if (hit)
+		return found;
+	else
+		return NULL;
+}
+
 /* find buf for given fd */
 static inline struct virtio_vdmabuf_buf *
 virtio_vdmabuf_find_buf_fd(struct virtio_vdmabuf_info *info, int fd)

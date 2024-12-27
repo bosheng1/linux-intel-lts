@@ -210,18 +210,13 @@ static int send_release_msg(struct virtio_vdmabuf_buf *vbuf)
 {
 	struct vhost_vdmabuf *vdmabuf = vbuf->data_priv;
 	int ret = 0;
-	int *op;
+	int op[65] = {0};
 	if (!vdmabuf)
 		return -ENODEV;
-	op = kcalloc(1, sizeof(int) * 65, GFP_KERNEL);
-	if (!op)
-		return -ENOMEM;
 
 	memcpy(op, &vbuf->buf_id, sizeof(vbuf->buf_id));
-
 	ret = send_msg_to_guest(vdmabuf->vmid, VIRTIO_VDMABUF_CMD_DMABUF_REL,
 				op);
-	kfree(op);
 	if (ret < 0) {
 		dev_err(drv_info->dev, "fail to send release cmd\n");
 		return ret;
@@ -270,6 +265,7 @@ static void vbuf_free(struct kref *kref)
 	struct vhost_vdmabuf *vdmabuf;
 	unsigned long flags;
 	vbuf = container_of(kref, typeof(*vbuf), ref);
+	vbuf->valid = false;
 	printk("bosheng dmabuf free:%p, is_export:%d\n",vbuf, vbuf->is_export);
 	vdmabuf = vbuf->data_priv;
 	virtio_vdmabuf_del_buf(drv_info, &vbuf->buf_id);
@@ -757,7 +753,6 @@ static int parse_msg(struct vhost_vdmabuf *vdmabuf,
 			printk("dmabuf rel: can't find buffer\n");
 			//ret = -EINVAL;
 		} else {
-			virtio_vdmabuf_del_buf(drv_info, &imp->buf_id);
 			put_vbuf(imp);
 		}
 		// ret = vhost_vdmabuf_add_event(vdmabuf, imp);
@@ -768,7 +763,6 @@ static int parse_msg(struct vhost_vdmabuf *vdmabuf,
 		buf_id = (virtio_vdmabuf_buf_id_t *)msg->op;
 		imp = virtio_vdmabuf_find_buf(drv_info, buf_id);
 		if (imp) {
-			virtio_vdmabuf_del_buf(drv_info, &imp->buf_id);
 			imp->unexport = true;
 			put_vbuf(imp);
 		} else {
@@ -1300,7 +1294,7 @@ static int import_ioctl(struct file *filp, void *data)
 	mutex_lock(&vdmabuf->dev.mutex);
 
 	/* look for dmabuf for the id */
-	imp = virtio_vdmabuf_find_buf(drv_info, &attr->buf_id);
+	imp = virtio_vdmabuf_find_and_get_buf(drv_info, &attr->buf_id);
 	if (!imp || !imp->valid || imp->unexport) {
 		mutex_unlock(&vdmabuf->dev.mutex);
 		dev_err(drv_info->dev, "no valid buf found with id = %llu\n",
@@ -1308,7 +1302,6 @@ static int import_ioctl(struct file *filp, void *data)
 		return -ENOENT;
 	}
 
-	get_vbuf(imp);
 	/* only if mapped pages are not present */
 	if (!imp->pages_info->pages) {
 		ret = vhost_vdmabuf_map_pages(vdmabuf->vmid, imp->pages_info);
@@ -1321,6 +1314,7 @@ static int import_ioctl(struct file *filp, void *data)
 	attr->fd = vhost_vdmabuf_exp_fd(imp, attr->flags);
 	if (attr->fd < 0) {
 		dev_err(drv_info->dev, "failed to get file descriptor\n");
+		ret = attr->fd;
 		goto fail_import;
 	}
 
@@ -1333,8 +1327,10 @@ fail_import:
 	/* not imported yet? */
 	if (!imp->imported) {
 		vhost_vdmabuf_unmap_pages(vdmabuf->vmid, imp->pages_info);
-		if (imp->dma_buf)
+		if (imp->dma_buf) {
 			kfree(imp->dma_buf);
+			imp->dma_buf = NULL;
+		}
 
 		if (imp->sgt) {
 			sg_free_table(imp->sgt);
@@ -1345,17 +1341,6 @@ fail_import:
 
 fail_map:
 	put_vbuf(imp);
-	/* Check if buffer is still valid and if not remove it
-	 * from imported list.
-	 */
-	if (!imp->valid && !imp->imported) {
-		virtio_vdmabuf_del_buf(drv_info, &imp->buf_id);
-		kfree(imp->priv);
-		kfree(imp->pages_info);
-		kfree(imp);
-	}
-
-	ret = attr->fd;
 
 	mutex_unlock(&vdmabuf->dev.mutex);
 
@@ -1995,7 +1980,7 @@ static int export_ioctl(struct file *filp, void *data)
 	exp->attach = attach;
 	exp->sgt = sgt;
 	exp->dma_buf = dmabuf;
-	exp->valid = 1;
+	exp->valid = true;
 
 	if (exp->sz_priv) {
 		/* copy private data to sgt_info */
@@ -2040,7 +2025,6 @@ static int export_ioctl(struct file *filp, void *data)
 	exp->filp = filp;
 	memcpy(&attr->buf_id, &exp->buf_id, sizeof(virtio_vdmabuf_buf_id_t));
 	virtio_vdmabuf_add_buf(drv_info, exp);
-	//get_vbuf(exp);
 	// mutex_unlock(&drv_info->g_mutex);
 
 	return ret;
@@ -2082,24 +2066,20 @@ static int unexport_ioctl(struct file *filp, void *data)
 	struct vhost_vdmabuf *vdmabuf = virtio_dmabuf->vdmabuf;
 	struct virtio_vdmabuf_unexport *attr = data;
 	struct virtio_vdmabuf_buf *exp;
-	int *op;
+	int op[65] = {0};
 	int nents, last_len;
 	int ret = 0;
 
 	if (!vdmabuf || !vdmabuf->active)
 		return -EINVAL;
 
-	exp = virtio_vdmabuf_find_buf(drv_info, &attr->buf_id);
+	exp = virtio_vdmabuf_find_and_get_buf(drv_info, &attr->buf_id);
 	if (!exp || !exp->valid) {
 		dev_err(drv_info->dev, "no valid buf found with id = %llu\n",
 			attr->buf_id.id);
 		return -ENOENT;
 	}
-	//put_vbuf(exp);
 	exp->unexport = true;
-	op = kcalloc(1, sizeof(int) * 65, GFP_KERNEL);
-	if (!op)
-		return -ENOMEM;
 
 	memcpy(op, &exp->buf_id, sizeof(exp->buf_id));
 
@@ -2107,10 +2087,8 @@ static int unexport_ioctl(struct file *filp, void *data)
 				VIRTIO_VDMABUF_CMD_DMABUF_UNEXPORT, op);
 	if (ret < 0) {
 		dev_err(drv_info->dev, "fail to send unexport cmd\n");
-		kfree(op);
-		return ret;
 	}
-	kfree(op);
+	put_vbuf(exp);
 	//virtio_vdmabuf_del_buf(drv_info, &exp->buf_id);
 
 	return ret;
@@ -2122,7 +2100,7 @@ static int query_ioctl(struct file *filp, void *data)
 	struct virtio_vdmabuf_buf *exp;
 	int ret = 0;
 
-	exp = virtio_vdmabuf_find_buf(drv_info, &attr->buf_id);
+	exp = virtio_vdmabuf_find_and_get_buf(drv_info, &attr->buf_id);
 	if (!exp || !exp->valid) {
 		dev_err(drv_info->dev, "no valid buf found with id = %llu\n",
 			attr->buf_id.id);
@@ -2133,16 +2111,21 @@ static int query_ioctl(struct file *filp, void *data)
 	} else if (attr->subcmd == VIRTIO_VDMABUF_QUERY_PRIV_INFO_SIZE) {
 		attr->info = exp->sz_priv;
 	} else if (attr->subcmd == VIRTIO_VDMABUF_QUERY_PRIV_INFO) {
-		if (!access_ok((void __user *)attr->info, exp->sz_priv)) {
-			printk("query ioctl, addr is not usable\n");
-			return -EINVAL;
-		}
-		if (copy_to_user((void __user *)attr->info, exp->priv, exp->sz_priv)) {
-			printk("query ioctl, copy to user failure\n");
-			return -EFAULT;
+		if (exp->sz_priv) {
+			if (!access_ok((void __user *)attr->info, exp->sz_priv)) {
+				printk("query ioctl, addr is not usable\n");
+				ret = -EINVAL;
+			}
+			if (!ret) {
+				if (copy_to_user((void __user *)attr->info, exp->priv, exp->sz_priv)) {
+					printk("query ioctl, copy to user failure\n");
+					ret = -EFAULT;
+				}
+			}
 		}
 	}
-	return 0;
+	put_vbuf(exp);
+	return ret;
 }
 
 static const struct virtio_vdmabuf_ioctl_desc virtio_vdmabuf_be_ioctls[] = {
