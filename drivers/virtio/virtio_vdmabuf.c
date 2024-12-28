@@ -124,7 +124,6 @@ static int send_msg_to_host(enum virtio_vdmabuf_cmd cmd, int *op)
 	struct virtio_vdmabuf *vdmabuf = drv_info->priv;
 	struct virtio_vdmabuf_msg *msg;
 	unsigned long flags;
-	int i;
 
 	switch (cmd) {
 	case VIRTIO_VDMABUF_CMD_EXPORT:
@@ -187,6 +186,7 @@ static void vbuf_free(struct kref *kref)
 	struct virtio_vdmabuf_buf *vbuf;
 	vbuf = container_of(kref, typeof(*vbuf), ref);
 	printk("bosheng dmabuf free:%p, is_export:%d\n",vbuf, vbuf->is_export);
+	vbuf->valid = false;
 	virtio_vdmabuf_del_buf(drv_info, &vbuf->buf_id);
 	if (vbuf->is_export) {
 		virtio_vdmabuf_free_buf(vbuf->pages_info);
@@ -283,9 +283,14 @@ static int add_event_buf(struct virtio_vdmabuf_buf *buf_info)
 	e_new = kvzalloc(sizeof(*e_new), GFP_KERNEL);
 	if (!e_new)
 		return -ENOMEM;
-
+	if (buf_info->sz_priv) {
+		e_new->e_data.data = kzalloc(buf_info->sz_priv ,GFP_KERNEL);
+		if (!e_new->e_data.data) {
+			return -ENOMEM;
+		}
+		memcpy(e_new->e_data.data, buf_info->priv, buf_info->sz_priv);
+	}
 	e_new->e_data.hdr.buf_id = buf_info->buf_id;
-	e_new->e_data.data = (void *)buf_info->priv;
 	e_new->e_data.hdr.size = buf_info->sz_priv;
 
 	spin_lock_irqsave(&eq->e_lock, irqflags);
@@ -298,6 +303,8 @@ static int add_event_buf(struct virtio_vdmabuf_buf *buf_info)
 					    struct virtio_vdmabuf_event, link);
 		list_del(&e_oldest->link);
 		eq->pending--;
+		if (e_new->e_data.data)
+			kfree(e_new->e_data.data);
 		kvfree(e_oldest);
 	}
 
@@ -385,7 +392,7 @@ static int register_exported(struct virtio_vdmabuf *vdmabuf,
 	imp->valid = true;
 	imp->is_export = false;
 	imp->data_priv = vdmabuf;
-
+	get_vbuf(imp);
 	virtio_vdmabuf_add_buf(drv_info, imp);
 
 	/* transferring private data */
@@ -394,6 +401,7 @@ static int register_exported(struct virtio_vdmabuf *vdmabuf,
 
 	/* generate import event */
 	ret = add_event_buf(imp);
+	put_vbuf(imp);
 	if (ret)
 		return ret;
 
@@ -895,7 +903,6 @@ static int unexport_ioctl(struct file *filp, void *data)
 	struct virtio_vdmabuf_unexport *attr = data;
 	struct virtio_vdmabuf_buf *exp;
 	int op[65] = {0};
-	int nents, last_len;
 	int ret = 0;
 
 	if (vdmabuf->vmid <= 0)
@@ -980,7 +987,7 @@ static int export_ioctl(struct file *filp, void *data)
 	exp->attach = attach;
 	exp->sgt = sgt;
 	exp->dma_buf = dmabuf;
-	exp->valid = 1;
+	exp->valid = true;
 
 	if (exp->sz_priv) {
 		/* copy private data to sgt_info */
@@ -1219,7 +1226,7 @@ static int import_ioctl(struct file *filp, void *data)
 
 	/* look for dmabuf for the id */
 	imp = virtio_vdmabuf_find_and_get_buf(drv_info, &attr->buf_id);
-	if (!imp || !imp->valid || imp->unexport) {
+	if (!imp || !imp->valid) {
 		dev_err(drv_info->dev, "no valid buf found with id = %llu\n",
 			attr->buf_id.id);
 		return -ENOENT;
@@ -1380,7 +1387,7 @@ ioctl_error:
 	return ret;
 }
 
-static unsigned int virtio_vdmabuf_event_poll(struct file *filp,
+static __poll_t virtio_vdmabuf_event_poll(struct file *filp,
 					      struct poll_table_struct *wait)
 {
 	struct virtio_vdmabuf *vdmabuf = filp->private_data;
@@ -1483,6 +1490,8 @@ put_back_event:
 
 			ret += e->e_data.hdr.size;
 			vdmabuf->evq->pending--;
+			if (e->e_data.data)
+				kfree(e->e_data.data);
 			kvfree(e);
 		}
 	}
@@ -1685,6 +1694,8 @@ static void __exit virtio_vdmabuf_deinit(void)
 
 	list_for_each_entry_safe(e, et, &vdmabuf->evq->e_list, link) {
 		list_del(&e->link);
+		if (e->e_data.data)
+			kfree(e->e_data.data);
 		kvfree(e);
 		vdmabuf->evq->pending--;
 	}

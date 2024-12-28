@@ -103,6 +103,7 @@ struct virtio_vdmabuf_info {
 	struct device *dev;
 
 	struct list_head head_vdmabuf_list;
+	struct list_head head_client_list;
 	struct list_head vm_instances;
 	spinlock_t vdmabuf_instances_lock;
 
@@ -256,7 +257,7 @@ virtio_vdmabuf_find_buf(struct virtio_vdmabuf_info *info,
 	spin_lock_irqsave(&info->buf_list_lock, flags);
 
 	hash_for_each_possible(info->buf_list, found, node, buf_id->id)
-		if (is_same_buf(found->buf_id, *buf_id))
+		if (is_same_buf(found->buf_id, *buf_id) && found->valid)
 			break;
 	spin_unlock_irqrestore(&info->buf_list_lock, flags);
 
@@ -274,7 +275,7 @@ virtio_vdmabuf_find_and_get_buf(struct virtio_vdmabuf_info *info,
 	spin_lock_irqsave(&info->buf_list_lock, flags);
 
 	hash_for_each_possible(info->buf_list, found, node, buf_id->id)
-		if (is_same_buf(found->buf_id, *buf_id)) {
+		if (is_same_buf(found->buf_id, *buf_id) && found->valid) {
 			if (kref_get_unless_zero(&found->ref)) {
 				hit = true;
 				break;
