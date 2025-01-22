@@ -104,6 +104,8 @@ struct virtio_vdmabuf_info {
 
 	struct list_head head_vdmabuf_list;
 	struct list_head head_client_list;
+	struct list_head vm_instances;
+	spinlock_t vm_instances_lock;
 	spinlock_t vdmabuf_instances_lock;
 
 	spinlock_t buf_list_lock;
@@ -111,6 +113,7 @@ struct virtio_vdmabuf_info {
 
 	void *priv;
 	struct mutex g_mutex;
+	struct notifier_block acrn_notifier;
 };
 
 /* IOCTL definitions
