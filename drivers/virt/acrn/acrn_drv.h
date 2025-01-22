@@ -225,6 +225,8 @@ int acrn_vm_register_notifier(struct notifier_block *nb);
 int acrn_vm_unregister_notifier(struct notifier_block *nb);
 void *acrn_get_hva(struct acrn_vm *vm, u64 gpa);
 struct page *acrn_get_page(struct acrn_vm *vm, u64 gpa);
+int acrn_vm_map(struct acrn_vm *vm, struct page **pages, u64 user_vm_pa, u64 nr_pages);
+int acrn_vm_unmap(struct acrn_vm *vm, u64 user_vm_pa, u64 len);
 
 int acrn_ioeventfd_init(struct acrn_vm *vm);
 int acrn_ioeventfd_config(struct acrn_vm *vm, struct acrn_ioeventfd *args);
