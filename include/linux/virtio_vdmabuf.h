@@ -104,6 +104,8 @@ struct virtio_vdmabuf_info {
 
 	struct list_head head_vdmabuf_list;
 	struct list_head head_client_list;
+	struct list_head vm_instances;
+	spinlock_t vm_instances_lock;
 	spinlock_t vdmabuf_instances_lock;
 
 	spinlock_t buf_list_lock;
@@ -111,6 +113,7 @@ struct virtio_vdmabuf_info {
 
 	void *priv;
 	struct mutex g_mutex;
+	struct notifier_block acrn_notifier;
 };
 
 /* IOCTL definitions
@@ -300,6 +303,30 @@ virtio_vdmabuf_find_buf_fd(struct virtio_vdmabuf_info *info, int fd)
 	spin_unlock_irqrestore(&info->buf_list_lock, flags);
 
 	return found;
+}
+
+static inline struct virtio_vdmabuf_buf *
+virtio_vdmabuf_find_fd_and_get_buf(struct virtio_vdmabuf_info *info,
+					int fd)
+{
+	struct virtio_vdmabuf_buf *found = NULL;
+	bool hit = false;
+	int i = 0;
+	unsigned long flags;
+	spin_lock_irqsave(&info->buf_list_lock, flags);
+
+	hash_for_each(info->buf_list, i, found, node)
+		if ((found->fd == fd) && found->valid) {
+			if (kref_get_unless_zero(&found->ref)) {
+				hit = true;
+				break;
+			}
+		}
+	spin_unlock_irqrestore(&info->buf_list_lock, flags);
+	if (hit)
+		return found;
+	else
+		return NULL;
 }
 
 /* delete buf from hash */
