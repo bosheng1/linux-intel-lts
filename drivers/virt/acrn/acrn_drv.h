@@ -19,6 +19,9 @@ extern struct miscdevice acrn_dev;
 #define ACRN_MEM_REGION_ADD	0
 #define ACRN_MEM_REGION_DEL	2
 
+#define ACRN_EVENT_CREATE_VM 0
+#define ACRN_EVENT_DESTROY_VM 1
+
 struct acrn_vm;
 struct acrn_ioreq_client;
 
@@ -217,6 +220,11 @@ void acrn_ioreq_range_del(struct acrn_ioreq_client *client,
 			  u32 type, u64 start, u64 end);
 
 int acrn_msi_inject(struct acrn_vm *vm, u64 msi_addr, u64 msi_data);
+
+int acrn_vm_register_notifier(struct notifier_block *nb);
+int acrn_vm_unregister_notifier(struct notifier_block *nb);
+int acrn_vm_map(struct acrn_vm *vm, struct page **pages, u64 user_vm_pa, u64 nr_pages);
+int acrn_vm_unmap(struct acrn_vm *vm, u64 user_vm_pa, u64 len);
 
 int acrn_ioeventfd_init(struct acrn_vm *vm);
 int acrn_ioeventfd_config(struct acrn_vm *vm, struct acrn_ioeventfd *args);
